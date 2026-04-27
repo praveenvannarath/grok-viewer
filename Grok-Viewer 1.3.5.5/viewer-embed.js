@@ -10,6 +10,7 @@
   const POST_GET_URL = "/rest/media/post/get";
   const REGEN_CONVERSATION_URL = "/rest/app-chat/conversations/new";
   const LIMIT = 40;
+  const GRID_TILES_PER_PAGE = 40;
   const SOURCE = "MEDIA_POST_SOURCE_LIKED";
   const REGEN_COOLDOWN_MS = 15000;
   const REGEN_MAX_CONCURRENT = 2;
@@ -139,6 +140,7 @@
     thumbAutoplay: false,
     variantPreviewAutoplay: true,
     sortOrder: "desc",
+    selectedPostIds: new Set(),
     renderToken: 0,
     pageSize: 38,
     pageByMode: { videos: 0, images: 0 },
@@ -186,6 +188,64 @@
 
   let lastUserKey = "";
   let chosenFolderHandle = null;
+  const HANDLE_DB_NAME = "grokViewerHandles";
+  const HANDLE_STORE = "folder";
+  const HANDLE_KEY = "chosenFolder";
+  const openHandleDB = () =>
+    new Promise((resolve, reject) => {
+      try {
+        const req = indexedDB.open(HANDLE_DB_NAME, 1);
+        req.onupgradeneeded = () => {
+          try {
+            req.result.createObjectStore(HANDLE_STORE);
+          } catch (error) {}
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error || new Error("idb-open-failed"));
+      } catch (error) {
+        reject(error);
+      }
+    });
+  const saveFolderHandle = async (handle) => {
+    if (!handle) return;
+    try {
+      const db = await openHandleDB();
+      await new Promise((resolve, reject) => {
+        const tx = db.transaction(HANDLE_STORE, "readwrite");
+        tx.objectStore(HANDLE_STORE).put(handle, HANDLE_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error || new Error("idb-tx-failed"));
+      });
+      db.close();
+    } catch (error) {}
+  };
+  const loadFolderHandle = async () => {
+    try {
+      const db = await openHandleDB();
+      const handle = await new Promise((resolve, reject) => {
+        const tx = db.transaction(HANDLE_STORE, "readonly");
+        const req = tx.objectStore(HANDLE_STORE).get(HANDLE_KEY);
+        req.onsuccess = () => resolve(req.result || null);
+        req.onerror = () => reject(req.error || new Error("idb-get-failed"));
+      });
+      db.close();
+      return handle || null;
+    } catch (error) {
+      return null;
+    }
+  };
+  const clearFolderHandle = async () => {
+    try {
+      const db = await openHandleDB();
+      await new Promise((resolve) => {
+        const tx = db.transaction(HANDLE_STORE, "readwrite");
+        tx.objectStore(HANDLE_STORE).delete(HANDLE_KEY);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => resolve();
+      });
+      db.close();
+    } catch (error) {}
+  };
   const supportsFolderHandles = () => typeof window.showDirectoryPicker === "function";
 
   const getCookie = (name) => {
@@ -329,6 +389,10 @@
 
   const ensureFolderModeReady = async () => {
     if (getDownloadMode() !== "folder_once") return true;
+    if (supportsFolderHandles() && !chosenFolderHandle) {
+      const restored = await loadFolderHandle();
+      if (restored) chosenFolderHandle = restored;
+    }
     if (!supportsFolderHandles()) {
       const existingPath = sanitizeFolderPath(state.settings && state.settings.folderPath ? state.settings.folderPath : "");
       if (existingPath) return true;
@@ -357,6 +421,7 @@
     const picked = await pickFolderWithDialog();
     if (!picked) return false;
     chosenFolderHandle = picked.handle || null;
+    if (chosenFolderHandle) saveFolderHandle(chosenFolderHandle);
     state.settings.folderPath = sanitizeFolderPath(picked.path || "Grok-Viewer");
     state.settings.downloadMode = "folder_once";
     persistSettings();
@@ -456,6 +521,7 @@
       return true;
     }
     chosenFolderHandle = picked.handle || null;
+    if (chosenFolderHandle) saveFolderHandle(chosenFolderHandle);
     const folderPath = sanitizeFolderPath(picked.path || existing || "Grok-Viewer");
     state.settings.folderPath = folderPath || "Grok-Viewer";
     state.settings.downloadMode = "folder_once";
@@ -538,13 +604,22 @@
       filter: { source: SOURCE }
     };
     if (cursor) body.cursor = cursor;
-    const response = await fetch(API_URL, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      credentials: "include",
-      body: JSON.stringify(body)
-    });
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    let response;
+    try {
+      response = await fetch(API_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify(body)
+      });
+    } catch (networkError) {
+      autoRefreshLastFetchStatus = -1;
+      throw networkError;
+    }
+    if (!response.ok) {
+      autoRefreshLastFetchStatus = response.status;
+      throw new Error(`HTTP ${response.status}`);
+    }
     return response.json();
   };
 
@@ -613,8 +688,8 @@
           parsed.searchParams.set("w", "44");
           parsed.searchParams.set("q", "3");
         } else {
-          parsed.searchParams.set("w", imageGridLow ? "56" : "88");
-          parsed.searchParams.set("q", imageGridLow ? "5" : "8");
+          parsed.searchParams.set("w", imageGridLow ? "112" : "176");
+          parsed.searchParams.set("q", imageGridLow ? "6" : "9");
         }
         parsed.searchParams.set("dpr", "1");
       }
@@ -1412,7 +1487,11 @@
 
     const merged = [];
     buckets.forEach((bucket) => {
-      const dedupedItems = dedupeItems(bucket.items || []);
+      const sample = (bucket.items || []).find((it) => it);
+      const dedupedItems =
+        sample && sample.kind === "image"
+          ? dedupeImageItems(bucket.items || [])
+          : dedupeItems(bucket.items || []);
       const candidateIds = Array.from(bucket.groupIds || []);
       let chosen = normalizeId(candidateIds[0] || "");
       let bestScore = -1;
@@ -1477,11 +1556,17 @@
   };
 
   const mergeOverlappingGridGroups = (groups) => {
+    const dedupForGroup = (items) => {
+      const arr = items || [];
+      const sample = arr.find((it) => it);
+      const isImage = sample && sample.kind === "image";
+      return isImage ? dedupeImageItems(arr) : dedupeItems(arr);
+    };
     const merged = (Array.isArray(groups) ? groups : [])
       .filter((group) => group && Array.isArray(group.items) && group.items.length)
       .map((group) => ({
         groupId: normalizeId(group.groupId) || normalizeId((group.items[0] && group.items[0].postId) || ""),
-        items: dedupeItems(group.items || [])
+        items: dedupForGroup(group.items || [])
       }));
     if (merged.length <= 1) return merged;
     let changed = true;
@@ -1497,7 +1582,7 @@
             setsIntersect(leftSig.postIds, rightSig.postIds) ||
             setsIntersect(leftSig.mediaKeys, rightSig.mediaKeys);
           if (!overlap) continue;
-          left.items = dedupeItems((left.items || []).concat(right.items || []));
+          left.items = dedupForGroup((left.items || []).concat(right.items || []));
           if (!left.groupId) left.groupId = right.groupId;
           merged.splice(j, 1);
           changed = true;
@@ -1727,6 +1812,7 @@
   };
 
   const prunePageCache = (mode, currentPage) => {
+    if (isGridMode()) return;
     const modeState = getModeState(mode);
     let removed = false;
     modeState.pageCache.forEach((value, key) => {
@@ -1781,33 +1867,77 @@
       modeState.pageCursors[pageIndex + 1] = nextCursor;
     }
     if (!nextCursor) modeState.exhausted = true;
+    invalidateGroupsMemo(mode);
   };
 
-  const ensurePageData = async (mode, pageIndex, options = {}) => {
+  const ensurePageData = async (_mode, pageIndex, options = {}) => {
     const silent = !!(options && options.silent);
     if (state.pageLoading) return;
     state.pageLoading = true;
-    const modeState = getModeState(mode);
+    flushPendingDeletes();
+    const videoState = getModeState("videos");
+    const imageState = getModeState("images");
+    const fetchOneIfPossible = async (mode) => {
+      const ms = getModeState(mode);
+      if (ms.exhausted) return false;
+      const fetchIndex = ms.pageCursors.length - 1;
+      await fetchAndCachePage(mode, fetchIndex);
+      return true;
+    };
     try {
       if (!silent) setStatus("Loading page...");
-      if (!modeState.pageCache.has(pageIndex)) {
-        if (modeState.pageCursors[pageIndex] !== undefined) {
-          await fetchAndCachePage(mode, pageIndex);
-        } else {
-          while (modeState.pageCursors.length <= pageIndex && !modeState.exhausted) {
-            const fetchIndex = modeState.pageCursors.length - 1;
-            await fetchAndCachePage(mode, fetchIndex);
+      if (isGridMode()) {
+        const requiredGroups = (pageIndex + 1) * GRID_TILES_PER_PAGE;
+        let safety = 0;
+        while ((!videoState.exhausted || !imageState.exhausted) && safety < 500) {
+          const totalLoaded = (videoState.totalLoaded || 0) + (imageState.totalLoaded || 0);
+          if (totalLoaded >= requiredGroups) {
+            const groupsSoFar = computeAllUnifiedItems().length;
+            if (groupsSoFar >= requiredGroups) break;
           }
-          if (modeState.pageCursors[pageIndex] !== undefined && !modeState.pageCache.has(pageIndex)) {
+          let didFetch = false;
+          if (await fetchOneIfPossible("videos")) didFetch = true;
+          if (await fetchOneIfPossible("images")) didFetch = true;
+          if (!didFetch) break;
+          safety += 1;
+        }
+        const totalGroups = computeAllUnifiedItems().length;
+        const lastUIPage = Math.max(0, Math.ceil(totalGroups / GRID_TILES_PER_PAGE) - 1);
+        const bothExhausted = videoState.exhausted && imageState.exhausted;
+        const safePage = bothExhausted
+          ? Math.max(0, Math.min(pageIndex, lastUIPage))
+          : pageIndex;
+        state.pageByMode.videos = safePage;
+        state.pageByMode.images = safePage;
+        updateItems();
+        return;
+      }
+      const ensureNonGrid = async (mode) => {
+        const ms = getModeState(mode);
+        if (!ms.pageCache.has(pageIndex)) {
+          if (ms.pageCursors[pageIndex] !== undefined) {
             await fetchAndCachePage(mode, pageIndex);
+          } else {
+            while (ms.pageCursors.length <= pageIndex && !ms.exhausted) {
+              const fetchIndex = ms.pageCursors.length - 1;
+              await fetchAndCachePage(mode, fetchIndex);
+            }
+            if (ms.pageCursors[pageIndex] !== undefined && !ms.pageCache.has(pageIndex)) {
+              await fetchAndCachePage(mode, pageIndex);
+            }
           }
         }
-      }
-      const safePage = modeState.exhausted
-        ? Math.max(0, Math.min(pageIndex, modeState.maxPageLoaded))
+      };
+      await Promise.all([ensureNonGrid("videos"), ensureNonGrid("images")]);
+      const maxLoaded = Math.max(videoState.maxPageLoaded, imageState.maxPageLoaded);
+      const bothExhausted = videoState.exhausted && imageState.exhausted;
+      const safePage = bothExhausted
+        ? Math.max(0, Math.min(pageIndex, maxLoaded))
         : pageIndex;
-      prunePageCache(mode, safePage);
-      state.pageByMode[mode] = safePage;
+      prunePageCache("videos", safePage);
+      prunePageCache("images", safePage);
+      state.pageByMode.videos = safePage;
+      state.pageByMode.images = safePage;
       updateItems();
     } catch (error) {
       if (!silent) setStatus("Page load failed.");
@@ -1820,18 +1950,31 @@
   const goToLastPage = async () => {
     if (state.pageLoading) return;
     state.pageLoading = true;
-    const mode = state.mode;
-    const modeState = getModeState(mode);
+    const videoState = getModeState("videos");
+    const imageState = getModeState("images");
     try {
       setStatus("Loading last page...");
-      while (!modeState.exhausted) {
-        const fetchIndex = modeState.pageCursors.length - 1;
-        await fetchAndCachePage(mode, fetchIndex);
-        prunePageCache(mode, modeState.maxPageLoaded);
+      const gridView = isGridMode();
+      const exhaustOne = async (mode) => {
+        const ms = getModeState(mode);
+        while (!ms.exhausted) {
+          const fetchIndex = ms.pageCursors.length - 1;
+          await fetchAndCachePage(mode, fetchIndex);
+          if (!gridView) prunePageCache(mode, ms.maxPageLoaded);
+        }
+      };
+      await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
+      let lastPage;
+      if (gridView) {
+        const totalGroups = computeAllUnifiedItems().length;
+        lastPage = Math.max(0, Math.ceil(totalGroups / GRID_TILES_PER_PAGE) - 1);
+      } else {
+        lastPage = Math.max(0, Math.max(videoState.maxPageLoaded, imageState.maxPageLoaded));
+        prunePageCache("videos", lastPage);
+        prunePageCache("images", lastPage);
       }
-      const lastPage = Math.max(0, modeState.maxPageLoaded);
-      prunePageCache(mode, lastPage);
-      state.pageByMode[mode] = lastPage;
+      state.pageByMode.videos = lastPage;
+      state.pageByMode.images = lastPage;
       updateItems();
     } catch (error) {
       setStatus("Page load failed.");
@@ -1853,6 +1996,7 @@
   const minimizeVideoItem = (item) =>
     item
       ? {
+          kind: "video",
           id: item.id,
           url: item.url,
           mediaUrl: item.mediaUrl,
@@ -1879,6 +2023,7 @@
   const minimizeImageItem = (item) =>
     item
       ? {
+          kind: "image",
           id: item.id,
           url: item.url,
           poster: item.poster,
@@ -1945,6 +2090,7 @@
       modeState.totalLoaded = rebuiltTotal;
       if (mode === "videos") modeState.seen = rebuiltSeen;
       modeState.maxPageLoaded = rebuiltMaxPageLoaded;
+      invalidateGroupsMemo(mode);
     }
     return items;
   };
@@ -1959,6 +2105,7 @@
     modeState.totalLoaded = 0;
     modeState.maxPageLoaded = -1;
     state.pageByMode[mode] = 0;
+    invalidateGroupsMemo(mode);
   };
 
   const resetAllModes = () => {
@@ -1995,17 +2142,69 @@
       .sort((a, b) => (toTime(a.createdAt) - toTime(b.createdAt)) * direction);
   };
 
-  const computeCurrentItems = () => {
-    const modeState = getModeState(state.mode);
-    const page = clampPage(state.mode);
-    const pageItems = modeState.pageCache.get(page) || [];
-    const items = state.mode === "images" ? dedupeImageItems(pageItems) : dedupeItems(pageItems);
-    const sorted = sortByCreatedAt(items);
-    if (state.mode === "videos") {
-      const playable = sorted.filter((entry) => ensurePlayableVideoItem(entry));
-      return isGridMode() ? groupItems(playable) : playable;
+  const computeAllGroupsForMode = (mode) => {
+    const stamp = groupsMemoStamp[mode];
+    if (groupsMemoFor[mode] === stamp && groupsMemoResult[mode]) {
+      return groupsMemoResult[mode];
     }
-    return isGridMode() ? groupItems(sorted) : sorted;
+    const modeState = getModeState(mode);
+    const raw = [];
+    Array.from(modeState.pageCache.keys())
+      .sort((a, b) => a - b)
+      .forEach((key) => {
+        const pageItems = modeState.pageCache.get(key) || [];
+        for (let i = 0; i < pageItems.length; i += 1) {
+          if (pageItems[i]) raw.push(pageItems[i]);
+        }
+      });
+    const items = mode === "images" ? dedupeImageItems(raw) : dedupeItems(raw);
+    const sorted = sortByCreatedAt(items);
+    const playable = mode === "videos"
+      ? sorted.filter((entry) => ensurePlayableVideoItem(entry))
+      : sorted;
+    const savedMode = state.mode;
+    state.mode = mode;
+    try {
+      const result = groupItems(playable);
+      groupsMemoResult[mode] = result;
+      groupsMemoFor[mode] = stamp;
+      return result;
+    } finally {
+      state.mode = savedMode;
+    }
+  };
+
+  const computeAllUnifiedItems = () => {
+    const videoGroups = computeAllGroupsForMode("videos");
+    const imageGroups = computeAllGroupsForMode("images");
+    const videoGroupIds = new Set();
+    videoGroups.forEach((group) => {
+      const id = group && group.groupId ? String(group.groupId) : "";
+      if (id) videoGroupIds.add(id);
+    });
+    const filteredImageGroups = imageGroups.filter((group) => {
+      if (!group) return false;
+      const id = group.groupId ? String(group.groupId) : "";
+      return !id || !videoGroupIds.has(id);
+    });
+    return sortByCreatedAt([...videoGroups, ...filteredImageGroups]);
+  };
+
+  const computeCurrentItems = () => {
+    if (isGridMode()) {
+      const merged = computeAllUnifiedItems();
+      const uiPage = clampPage(state.mode);
+      const start = uiPage * GRID_TILES_PER_PAGE;
+      return merged.slice(start, start + GRID_TILES_PER_PAGE);
+    }
+    const page = clampPage(state.mode);
+    const videoState = getModeState("videos");
+    const imageState = getModeState("images");
+    const videosPage = videoState.pageCache.get(page) || [];
+    const imagesPage = imageState.pageCache.get(page) || [];
+    const videosD = dedupeItems(videosPage).filter((entry) => ensurePlayableVideoItem(entry));
+    const imagesD = dedupeImageItems(imagesPage);
+    return sortByCreatedAt([...videosD, ...imagesD]);
   };
 
   const isItemDownloaded = (mode, item) => {
@@ -2017,21 +2216,32 @@
   };
 
   const getPageCount = (mode) => {
-    const modeState = getModeState(mode);
-    const base = Math.max(1, modeState.maxPageLoaded + 1);
-    if (modeState.maxPageLoaded < 0) return 1;
-    if (modeState.exhausted) return base;
+    const videoState = getModeState("videos");
+    const imageState = getModeState("images");
+    const bothExhausted = videoState.exhausted && imageState.exhausted;
+    if (isGridMode()) {
+      const totalGroups = computeAllUnifiedItems().length;
+      const pages = Math.max(1, Math.ceil(totalGroups / GRID_TILES_PER_PAGE));
+      return bothExhausted ? pages : pages + 1;
+    }
+    const maxLoaded = Math.max(videoState.maxPageLoaded, imageState.maxPageLoaded);
+    const base = Math.max(1, maxLoaded + 1);
+    if (maxLoaded < 0) return 1;
+    if (bothExhausted) return base;
     return base + 1;
   };
 
   const clampPage = (mode) => {
     const current = state.pageByMode[mode] || 0;
     let next = Math.max(0, current);
-    if (getModeState(mode).exhausted) {
+    const videoState = getModeState("videos");
+    const imageState = getModeState("images");
+    if (videoState.exhausted && imageState.exhausted) {
       const pageCount = getPageCount(mode);
       next = Math.min(pageCount - 1, next);
     }
-    state.pageByMode[mode] = next;
+    state.pageByMode.videos = next;
+    state.pageByMode.images = next;
     return next;
   };
 
@@ -2041,7 +2251,7 @@
     }
     const downloaded = state.downloadedLookup && state.downloadedLookup[mode] ? state.downloadedLookup[mode] : new Set();
     const modeState = getModeState(mode);
-    const pageStart = clampPage(mode);
+    const pageStart = isGridMode() ? 0 : clampPage(mode);
     const maxItems = Math.max(1, targetCount);
     const fresh = [];
     const duplicates = [];
@@ -2142,19 +2352,172 @@
     }
   };
 
+  const refetchApiPageInPlace = async (mode, pageIdx) => {
+    const modeState = getModeState(mode);
+    const cursor = modeState.pageCursors[pageIdx] || null;
+    const data = await fetchPage(cursor || undefined);
+    const posts = data && data.posts ? data.posts : [];
+    const extracted = extractItems(posts);
+    const rawItems = mode === "images" ? extracted.images || [] : extracted.videos || [];
+    const deduped = mode === "images" ? dedupeImageItems(rawItems) : dedupeItems(rawItems);
+    const fresh = [];
+    deduped.forEach((item) => {
+      const minItem = mode === "images" ? minimizeImageItem(item) : minimizeVideoItem(item);
+      if (!minItem) return;
+      if (mode === "videos" && !ensurePlayableVideoItem(minItem)) return;
+      fresh.push(minItem);
+    });
+    modeState.pageCache.set(pageIdx, fresh);
+    const nextCursor = data && data.nextCursor ? data.nextCursor : null;
+    if (nextCursor && modeState.pageCursors[pageIdx + 1] === undefined) {
+      modeState.pageCursors[pageIdx + 1] = nextCursor;
+    }
+  };
+
+  const rebuildModeSeenAndTotal = (mode) => {
+    const modeState = getModeState(mode);
+    const rebuiltSeen = new Set();
+    let rebuiltTotal = 0;
+    modeState.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        if (!entry) return;
+        rebuiltTotal += 1;
+        if (mode === "videos") {
+          const keys = getVideoDedupKeys(entry);
+          keys.forEach((key) => {
+            if (key) rebuiltSeen.add(key);
+          });
+        } else {
+          const key = getImageKey(entry);
+          if (key) rebuiltSeen.add(key);
+        }
+      });
+    });
+    modeState.seen = rebuiltSeen;
+    modeState.totalLoaded = rebuiltTotal;
+  };
+
+  const refreshCurrentPage = async () => {
+    if (state.busy) return;
+    state.busy = true;
+    setStatus("Refreshing page...");
+    addLog("Refresh current page requested");
+    flushPendingDeletes();
+    try {
+      await ensureUserScope();
+      const mode = state.mode;
+      const modeState = getModeState(mode);
+      const visibleItems = state.items || [];
+      const visiblePostIds = new Set();
+      visibleItems.forEach((entry) => {
+        if (!entry) return;
+        const variants = Array.isArray(entry.variants) && entry.variants.length
+          ? entry.variants
+          : [entry];
+        variants.forEach((v) => {
+          const pid = v && v.postId ? String(v.postId) : "";
+          if (pid) visiblePostIds.add(pid);
+        });
+      });
+      const pagesToRefresh = [];
+      modeState.pageCache.forEach((pageItems, key) => {
+        const items = pageItems || [];
+        for (let i = 0; i < items.length; i += 1) {
+          const pid = items[i] && items[i].postId ? String(items[i].postId) : "";
+          if (pid && visiblePostIds.has(pid)) {
+            pagesToRefresh.push(key);
+            return;
+          }
+        }
+      });
+      if (!pagesToRefresh.length) {
+        pagesToRefresh.push(state.pageByMode[mode] || 0);
+      }
+      pagesToRefresh.sort((a, b) => a - b);
+      for (let i = 0; i < pagesToRefresh.length; i += 1) {
+        try {
+          await refetchApiPageInPlace(mode, pagesToRefresh[i]);
+        } catch (error) {
+          addLog(`Page ${pagesToRefresh[i]} refresh failed: ${error.message}`);
+        }
+      }
+      rebuildModeSeenAndTotal(mode);
+      invalidateGroupsMemo(mode);
+      chrome.storage.local.set(
+        { [STORAGE_KEY]: { items: state.videoItems, updatedAt: Date.now() } },
+        () => {}
+      );
+      updateItems();
+      addLog("Refresh current page done");
+      setReadyStatus();
+    } catch (error) {
+      addLog(`Refresh current page failed: ${error.message}`);
+      setStatus("Refresh failed.");
+    } finally {
+      state.busy = false;
+      updateActionButtons();
+    }
+  };
+
+  const AUTO_REFRESH_BASE_MS = 5000;
+  const AUTO_REFRESH_MAX_MS = 60000;
+  const AUTO_REFRESH_MAX_FAILURES = 10;
+
+  const isAutoRefreshBackoffStatus = (status) => {
+    const code = Number(status || 0);
+    if (code === -1) return true;
+    if (code === 408 || code === 425 || code === 429) return true;
+    return code >= 500;
+  };
+
+  const computeAutoRefreshDelay = () => {
+    if (autoRefreshFailures <= 0) return AUTO_REFRESH_BASE_MS;
+    const exp = AUTO_REFRESH_BASE_MS * Math.pow(2, autoRefreshFailures);
+    const capped = Math.min(AUTO_REFRESH_MAX_MS, exp);
+    const jitter = 0.5 + Math.random() * 0.5;
+    return Math.max(AUTO_REFRESH_BASE_MS, Math.round(capped * jitter));
+  };
+
   const stopAutoRefreshLoop = () => {
     if (!autoRefreshTimer) return;
-    clearInterval(autoRefreshTimer);
+    clearTimeout(autoRefreshTimer);
     autoRefreshTimer = null;
+  };
+
+  const scheduleNextAutoRefresh = (delayOverride) => {
+    stopAutoRefreshLoop();
+    if (!state.settings || !state.settings.autoRefreshAlways) return;
+    const delay = typeof delayOverride === "number" ? delayOverride : computeAutoRefreshDelay();
+    autoRefreshTimer = setTimeout(runAutoRefreshTick, delay);
+  };
+
+  const runAutoRefreshTick = async () => {
+    autoRefreshTimer = null;
+    if (!state.settings || !state.settings.autoRefreshAlways) return;
+    if (state.busy || state.pageLoading) {
+      scheduleNextAutoRefresh(AUTO_REFRESH_BASE_MS);
+      return;
+    }
+    autoRefreshLastFetchStatus = 0;
+    try {
+      await refresh({ silent: true, includeOtherMode: true });
+    } finally {
+      const status = autoRefreshLastFetchStatus;
+      if (isAutoRefreshBackoffStatus(status)) {
+        autoRefreshFailures = Math.min(autoRefreshFailures + 1, AUTO_REFRESH_MAX_FAILURES);
+        addLog(`Auto refresh backoff: status=${status} failures=${autoRefreshFailures}`);
+      } else {
+        autoRefreshFailures = 0;
+      }
+      scheduleNextAutoRefresh();
+    }
   };
 
   const updateAutoRefreshLoop = () => {
     stopAutoRefreshLoop();
+    autoRefreshFailures = 0;
     if (!state.settings || !state.settings.autoRefreshAlways) return;
-    autoRefreshTimer = setInterval(() => {
-      if (state.busy || state.pageLoading) return;
-      refresh({ silent: true, includeOtherMode: true });
-    }, 5000);
+    scheduleNextAutoRefresh(AUTO_REFRESH_BASE_MS);
   };
 
   const sendToFavorites = (payload) =>
@@ -2286,6 +2649,49 @@
     if (!code) return true;
     if (code === 408 || code === 409 || code === 425 || code === 429) return true;
     return code >= 500;
+  };
+
+  const collectCascadingPostIds = (rootPostIds) => {
+    const allEntries = [];
+    ["videos", "images"].forEach((mode) => {
+      const modeState = getModeState(mode);
+      modeState.pageCache.forEach((pageItems) => {
+        (pageItems || []).forEach((entry) => {
+          if (entry) allEntries.push(entry);
+        });
+      });
+    });
+    const byId = new Map();
+    allEntries.forEach((entry) => {
+      const pid = normalizeId(entry.postId);
+      if (pid && !byId.has(pid)) byId.set(pid, entry);
+    });
+    const result = new Set();
+    const queue = [];
+    const pushMaybe = (id) => {
+      const norm = normalizeId(id);
+      if (norm && !result.has(String(norm))) queue.push(String(norm));
+    };
+    (rootPostIds || []).forEach((id) => pushMaybe(id));
+    while (queue.length) {
+      const pid = queue.pop();
+      if (!pid || result.has(pid)) continue;
+      result.add(pid);
+      const entry = byId.get(pid);
+      if (!entry) continue;
+      pushMaybe(entry.originalPostId);
+      pushMaybe(entry.parentPostId);
+      const childVideoIds = Array.isArray(entry.childVideoIds) ? entry.childVideoIds : [];
+      childVideoIds.forEach((cid) => pushMaybe(cid));
+      for (let i = 0; i < allEntries.length; i += 1) {
+        const other = allEntries[i];
+        if (!other) continue;
+        const op = normalizeId(other.parentPostId);
+        const oo = normalizeId(other.originalPostId);
+        if (op === pid || oo === pid) pushMaybe(other.postId);
+      }
+    }
+    return result;
   };
 
   const deletePostWithRetry = async (postId, maxRetries) => {
@@ -2424,6 +2830,7 @@
     modeState.totalLoaded = rebuiltTotal;
     modeState.seen = rebuiltSeen;
     modeState.maxPageLoaded = rebuiltMaxPageLoaded;
+    invalidateGroupsMemo("videos");
     clearRemovedVideoPostState([targetId]);
     return true;
   };
@@ -2452,78 +2859,74 @@
   const deleteItem = async (item) => {
     const targetItem = resolveActiveItem(item);
     if (!targetItem || !targetItem.postId || state.busy) return;
-    if (!window.confirm("Do you want to delete this file?")) return;
+    if (!window.confirm("Delete this post and all related posts (original + variants + children)?")) return;
     playActionAudio("delete");
     state.busy = true;
+    updateActionButtons();
     const isImages = state.mode === "images" && targetItem.url && isImage(targetItem.url, targetItem.mimeType);
-    const isGridDelete = isGridMode() && !isImages;
-    setStatus(isImages ? "Deleting image..." : "Deleting video...");
-    setThumbStatus(targetItem.postId, "deleting", "Deleting...");
-    if (isImages) {
-      const childIds = Array.from(new Set((targetItem.childVideoIds || []).filter(Boolean)));
-      for (let i = 0; i < childIds.length; i += 1) {
-        const res = await likePost(childIds[i]);
-        if (!res.ok) {
-          state.busy = false;
-          setStatus("Delete failed.");
-          showToast("Delete failed.", "error");
-          setThumbStatus(item.postId, "failed", "Failed");
-          updateActionButtons();
-          return;
-        }
-        await sleep(140);
-      }
-    }
-    const result = await deletePost(targetItem.postId);
-    state.busy = false;
-    if (!result.ok) {
-      setStatus("Delete failed.");
-      showToast("Delete failed.", "error");
-      setThumbStatus(item.postId, "failed", "Failed");
+    const ids = Array.from(collectCascadingPostIds([targetItem.postId]));
+    if (!ids.length) {
+      state.busy = false;
       updateActionButtons();
       return;
     }
-    animateThumbRemoval(targetItem.postId);
-    let remainingVariants = null;
-    if (isGridDelete) {
-      const group = state.items.find(
-        (entry) => entry && entry.variants && entry.variants.some((variant) => variant && variant.postId === targetItem.postId)
-      );
-      if (group && group.variants) {
-        remainingVariants = group.variants.filter((variant) => variant && variant.postId !== targetItem.postId);
+    const total = ids.length;
+    const totalSafe = Math.max(1, total);
+    let processed = 0;
+    let successCount = 0;
+    const failed = [];
+    setStatus(total === 1 ? "Deleting post..." : `Deleting ${total} posts...`);
+    showDeleteProgress(`Deleting 0/${total}`, 0);
+    await runPool(
+      ids,
+      Math.min(6, Math.max(3, Number(navigator.hardwareConcurrency) || 4)),
+      async (postId) => {
+        const result = await deletePostWithRetry(postId, 2);
+        processed += 1;
+        if (result && result.ok) {
+          successCount += 1;
+          animateThumbRemoval(postId);
+        } else {
+          failed.push(postId);
+        }
+        showDeleteProgress(`Deleting ${processed}/${total}`, processed / totalSafe);
       }
-    }
-    const modeState = getModeState(state.mode);
-    modeState.pageCache.forEach((pageItems, key) => {
-      const filtered = (pageItems || []).filter((entry) => entry.postId !== targetItem.postId);
-      modeState.pageCache.set(key, filtered);
-    });
-    if (isGridDelete && remainingVariants && remainingVariants.length) {
-      const page = state.pageByMode[state.mode] || 0;
-      const pageItems = modeState.pageCache.get(page) || [];
-      const existing = new Set(pageItems.map((entry) => entry && entry.postId).filter(Boolean));
-      remainingVariants.forEach((variant) => {
-        if (!variant || !variant.postId || existing.has(variant.postId)) return;
-        pageItems.push(variant);
-        existing.add(variant.postId);
+    );
+    const removedIds = new Set(ids.filter((id) => !failed.includes(id)));
+    if (removedIds.size) {
+      removedIds.forEach((id) => {
+        const norm = normalizeId(id);
+        if (norm) pendingDeleteMarkers.add(String(norm));
       });
-      modeState.pageCache.set(page, pageItems);
+      invalidateGroupsMemo();
     }
-    if (modeState.totalLoaded > 0) modeState.totalLoaded -= 1;
-    let variantRemoveDelay = 0;
-    if (variantStripEl && targetItem.postId) {
-      const variantThumb = variantStripEl.querySelector(`.variant-thumb[data-variant-id="${targetItem.postId}"]`);
-      if (variantThumb) {
-        variantThumb.classList.add("removing");
-        variantRemoveDelay = 180;
-      }
-    }
-    if (variantRemoveDelay) {
-      setTimeout(() => updateItems(), variantRemoveDelay);
-    } else {
+    const lightboxOpenNow = Boolean(lightboxEl && lightboxEl.classList.contains("open"));
+    if (lightboxOpenNow) {
       updateItems();
+      if (!state.items.length) {
+        closeLightbox();
+      } else {
+        state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.items.length - 1));
+        loadPlayer();
+      }
+    } else {
+      applyBlurToMarkedThumbs();
     }
-    setStatus(isImages ? "Image deleted." : "Video deleted.");
+    state.busy = false;
+    if (failed.length) {
+      setStatus(`Failed ${failed.length} deletion${failed.length === 1 ? "" : "s"}.`);
+      showToast("Some deletions failed.", "error");
+    } else if (successCount > 0) {
+      setStatus(
+        successCount === 1
+          ? isImages ? "Image deleted." : "Video deleted."
+          : `${successCount} posts deleted.`
+      );
+      showDeleteDone("Deleted");
+    } else {
+      setStatus("No posts deleted.");
+    }
+    hideDownloadProgress(0);
     updateActionButtons();
   };
 
@@ -2533,22 +2936,19 @@
     deleteItem(item);
   };
 
-  const deleteWholeCompilation = async () => {
+  const deleteWholeCompilation = async (groupArg) => {
     if (!isGridMode() || state.mode !== "videos") return;
-    const group = state.items[state.selectedIndex];
+    const group = groupArg || state.items[state.selectedIndex];
     if (!group || !Array.isArray(group.variants) || group.variants.length <= 1) return;
     if (state.busy) return;
-    if (!window.confirm("Do you want to delete the whole compilation?")) return;
+    if (!window.confirm("Delete the whole compilation (and its original post + children)?")) return;
     playActionAudio("delete");
     state.busy = true;
     updateActionButtons();
-    const ids = Array.from(
-      new Set(
-        (group.variants || [])
-          .map((variant) => String((variant && variant.postId) || "").trim())
-          .filter(Boolean)
-      )
-    );
+    const variantIds = (group.variants || [])
+      .map((variant) => String((variant && variant.postId) || "").trim())
+      .filter(Boolean);
+    const ids = Array.from(collectCascadingPostIds(variantIds));
     if (!ids.length) {
       state.busy = false;
       updateActionButtons();
@@ -2579,62 +2979,26 @@
 
     const removedIds = new Set(ids.filter((id) => !failed.includes(id)));
     if (removedIds.size) {
-      const modeState = getModeState("videos");
-      const shouldDropEntry = (entry) => {
-        if (!entry) return false;
-        const postId = normalizeId(entry.postId);
-        if (postId && removedIds.has(postId)) return true;
-        const parentId = normalizeId(entry.parentPostId);
-        if (parentId && removedIds.has(parentId)) return true;
-        const originalId = normalizeId(entry.originalPostId);
-        if (originalId && removedIds.has(originalId)) return true;
-        return false;
-      };
-      modeState.pageCache.forEach((pageItems, key) => {
-        const filtered = (pageItems || []).filter((entry) => !shouldDropEntry(entry));
-        modeState.pageCache.set(key, filtered);
+      removedIds.forEach((id) => {
+        const norm = normalizeId(id);
+        if (norm) pendingDeleteMarkers.add(String(norm));
       });
-      const rebuiltSeen = new Set();
-      let rebuiltTotal = 0;
-      modeState.pageCache.forEach((pageItems) => {
-        (pageItems || []).forEach((entry) => {
-          rebuiltTotal += 1;
-          const keys = getVideoDedupKeys(entry);
-          keys.forEach((key) => {
-            if (key) rebuiltSeen.add(key);
-          });
-        });
-      });
-      modeState.totalLoaded = rebuiltTotal;
-      modeState.seen = rebuiltSeen;
-      const cachedPages = Array.from(modeState.pageCache.keys()).filter((page) => {
-        const pageItems = modeState.pageCache.get(page) || [];
-        return pageItems.length > 0;
-      });
-      modeState.maxPageLoaded = cachedPages.length ? Math.max(...cachedPages) : -1;
-      clearRemovedVideoPostState(removedIds);
+      invalidateGroupsMemo("videos");
     }
 
-    updateItems();
-    if (!state.items.length) {
-      closeLightbox();
+    const lightboxOpenNow = Boolean(lightboxEl && lightboxEl.classList.contains("open"));
+    if (lightboxOpenNow) {
+      updateItems();
+      if (!state.items.length) {
+        closeLightbox();
+      } else {
+        state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.items.length - 1));
+        loadPlayer();
+      }
     } else {
-      state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.items.length - 1));
-      loadPlayer();
+      applyBlurToMarkedThumbs();
     }
     state.busy = false;
-    if (removedIds.size) {
-      await refresh({ silent: true, includeOtherMode: true });
-      const lightboxOpenNow = Boolean(lightboxEl && lightboxEl.classList.contains("open"));
-      if (lightboxOpenNow) {
-        if (!state.items.length) {
-          closeLightbox();
-        } else {
-          state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.items.length - 1));
-          loadPlayer();
-        }
-      }
-    }
     if (failed.length) {
       setStatus(`Failed ${failed.length} deletions.`);
       showToast("Some deletions failed.", "error");
@@ -3353,9 +3717,10 @@
     downloadFile(item);
   };
 
-  const downloadGroup = async () => {
-    const group = state.items[state.selectedIndex];
+  const downloadGroup = async (groupArg, options) => {
+    const group = groupArg || state.items[state.selectedIndex];
     if (!group || !group.variants || group.variants.length <= 1 || state.busy) return;
+    const skipFinalWait = !!(options && options.skipFinalWait);
     const ready = await ensureFolderModeReady();
     if (!ready) return;
     const isImages = state.mode === "images";
@@ -3405,7 +3770,8 @@
           const { dosTime, dosDate } = toDosTimeDate(new Date());
           const baseUrl = (item.url || "").split(/[?#]/)[0];
           const extMatch = baseUrl.match(/\\.([a-z0-9]{2,6})$/i);
-          const ext = extMatch ? extMatch[1].toLowerCase() : isImages ? "jpg" : "mp4";
+          const itemIsImage = item && item.kind === "image";
+          const ext = extMatch ? extMatch[1].toLowerCase() : (itemIsImage || isImages) ? "jpg" : "mp4";
           const name = `${item.postId || item.id}.${ext}`;
           files.push({
             name,
@@ -3448,13 +3814,17 @@
           rememberAskEachFolderFromDownloadOutcome(archiveVerify.outcome, started.filename || archiveName);
         }
         recordDownloadedItems(state.mode, items);
-        renderGrid();
+        syncVisibleDownloadedBadges();
         const startText = "Starting download of archive 1...";
         setStatus(startText);
         setDownloadProgress(startText, 0);
         const effectiveName = started.filename || archiveName;
         showDownloadReady("Your file is ready. Click here", effectiveName);
-        await waitForDownloadWithTimeout(effectiveName, true, 20000);
+        state.busy = false;
+        updateActionButtons();
+        if (!skipFinalWait) {
+          await waitForDownloadWithTimeout(effectiveName, true, 20000);
+        }
       } catch (error) {
         setStatus("Download failed.");
       } finally {
@@ -3468,7 +3838,273 @@
         }
       }
     };
-    run();
+    return run();
+  };
+
+  const collectVideosUnderPost = (item) => {
+    if (!item) return [];
+    const seedIds = item.variants && item.variants.length
+      ? item.variants.map((v) => v && v.postId).filter(Boolean)
+      : [item.postId].filter(Boolean);
+    if (!seedIds.length) return [];
+    const allIds = collectCascadingPostIds(seedIds);
+    const videoState = getModeState("videos");
+    const seen = new Set();
+    const videos = [];
+    videoState.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        if (!entry || !entry.postId) return;
+        const pid = String(entry.postId);
+        if (!allIds.has(pid) || seen.has(pid)) return;
+        seen.add(pid);
+        videos.push(entry);
+      });
+    });
+    return videos;
+  };
+
+  const collectMediaUnderPost = (item) => {
+    if (!item) return [];
+    const seedIds = item.variants && item.variants.length
+      ? item.variants.map((v) => v && v.postId).filter(Boolean)
+      : [item.postId].filter(Boolean);
+    if (!seedIds.length) return [];
+    const allIds = collectCascadingPostIds(seedIds);
+    const seen = new Set();
+    const media = [];
+    ["videos", "images"].forEach((mode) => {
+      const ms = getModeState(mode);
+      ms.pageCache.forEach((pageItems) => {
+        (pageItems || []).forEach((entry) => {
+          if (!entry || !entry.postId) return;
+          const pid = String(entry.postId);
+          if (!allIds.has(pid) || seen.has(pid)) return;
+          seen.add(pid);
+          media.push(entry);
+        });
+      });
+    });
+    return media;
+  };
+
+  const downloadAllVideosForItem = async (item) => {
+    const media = collectMediaUnderPost(item);
+    if (!media.length) {
+      showToast("No media found under this post.", "info");
+      return;
+    }
+    if (media.length === 1) {
+      downloadFile(media[0]);
+      return;
+    }
+    await downloadGroup({ variants: media });
+  };
+
+  const deleteAllVideosForItem = async (item) => {
+    if (state.busy) return;
+    const videos = collectVideosUnderPost(item);
+    if (!videos.length) {
+      showToast("No videos found under this post.", "info");
+      return;
+    }
+    const ids = videos.map((v) => v && v.postId).filter(Boolean);
+    if (!ids.length) return;
+    if (!window.confirm(`Delete ${ids.length} video${ids.length === 1 ? "" : "s"} under this post?`)) return;
+    playActionAudio("delete");
+    state.busy = true;
+    updateActionButtons();
+    const totalSafe = Math.max(1, ids.length);
+    let processed = 0;
+    let successCount = 0;
+    const failed = [];
+    setStatus(ids.length === 1 ? "Deleting video..." : `Deleting ${ids.length} videos...`);
+    showDeleteProgress(`Deleting 0/${ids.length}`, 0);
+    await runPool(
+      ids,
+      Math.min(6, Math.max(3, Number(navigator.hardwareConcurrency) || 4)),
+      async (postId) => {
+        const result = await deletePostWithRetry(postId, 2);
+        processed += 1;
+        if (result && result.ok) {
+          successCount += 1;
+          animateThumbRemoval(postId);
+        } else {
+          failed.push(postId);
+        }
+        showDeleteProgress(`Deleting ${processed}/${ids.length}`, processed / totalSafe);
+      }
+    );
+    const removedIds = new Set(ids.filter((id) => !failed.includes(id)));
+    if (removedIds.size) {
+      removedIds.forEach((id) => {
+        const norm = normalizeId(id);
+        if (norm) pendingDeleteMarkers.add(String(norm));
+      });
+      invalidateGroupsMemo();
+    }
+    const lightboxOpenNow = Boolean(lightboxEl && lightboxEl.classList.contains("open"));
+    if (lightboxOpenNow) {
+      updateItems();
+      if (!state.items.length) {
+        closeLightbox();
+      } else {
+        state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.items.length - 1));
+        loadPlayer();
+      }
+    } else {
+      applyBlurToMarkedThumbs();
+    }
+    state.busy = false;
+    if (failed.length) {
+      setStatus(`Failed ${failed.length} deletion${failed.length === 1 ? "" : "s"}.`);
+      showToast("Some deletions failed.", "error");
+    } else if (successCount > 0) {
+      setStatus(successCount === 1 ? "Video deleted." : `${successCount} videos deleted.`);
+      showDeleteDone("Videos deleted");
+    } else {
+      setStatus("No videos deleted.");
+    }
+    hideDownloadProgress(0);
+    updateActionButtons();
+  };
+
+  const updateDeleteCheckedButton = () => {
+    const count = state.selectedPostIds.size;
+    if (deleteCheckedBtn) {
+      deleteCheckedBtn.textContent = count > 0 ? `Delete Checked (${count})` : "Delete Checked";
+      deleteCheckedBtn.disabled = count === 0 || state.busy;
+    }
+    if (downloadCheckedBtn) {
+      downloadCheckedBtn.textContent = count > 0 ? `Download Checked (${count})` : "Download Checked";
+      downloadCheckedBtn.disabled = count === 0 || state.busy;
+    }
+  };
+
+  const collectMediaForPostIds = (postIds) => {
+    const allIds = collectCascadingPostIds(postIds);
+    const seen = new Set();
+    const media = [];
+    ["videos", "images"].forEach((mode) => {
+      const ms = getModeState(mode);
+      ms.pageCache.forEach((pageItems) => {
+        (pageItems || []).forEach((entry) => {
+          if (!entry || !entry.postId) return;
+          const pid = String(entry.postId);
+          if (!allIds.has(pid) || seen.has(pid)) return;
+          seen.add(pid);
+          media.push(entry);
+        });
+      });
+    });
+    return media;
+  };
+
+  const downloadCheckedItems = async () => {
+    if (state.busy) return;
+    const ids = Array.from(state.selectedPostIds).filter(Boolean);
+    if (!ids.length) return;
+    let processed = 0;
+    let succeeded = 0;
+    const skipped = [];
+    for (let i = 0; i < ids.length; i += 1) {
+      const postId = ids[i];
+      const media = collectMediaForPostIds([postId]);
+      if (!media.length) {
+        skipped.push(postId);
+        continue;
+      }
+      setStatus(`Downloading post ${i + 1} of ${ids.length}...`);
+      try {
+        if (media.length === 1) {
+          await downloadFile(media[0]);
+        } else {
+          await downloadGroup({ variants: media }, { skipFinalWait: true });
+        }
+        succeeded += 1;
+      } catch (error) {
+        skipped.push(postId);
+      }
+      processed += 1;
+      if (i < ids.length - 1) {
+        await sleep(150);
+      }
+    }
+    if (succeeded === 0) {
+      showToast("No posts downloaded.", "error");
+    } else if (skipped.length) {
+      showToast(`${succeeded} of ${ids.length} posts downloaded; ${skipped.length} skipped.`, "info");
+    } else {
+      showToast(`${succeeded} post${succeeded === 1 ? "" : "s"} downloaded.`, "info");
+    }
+    setStatus(`Downloaded ${succeeded}/${ids.length} posts.`);
+  };
+
+  const deleteCheckedItems = async () => {
+    if (state.busy) return;
+    const ids = Array.from(state.selectedPostIds).filter(Boolean);
+    if (!ids.length) return;
+    if (!window.confirm(`Delete ${ids.length} checked post${ids.length === 1 ? "" : "s"} (and all related)?`)) return;
+    playActionAudio("delete");
+    state.busy = true;
+    updateActionButtons();
+    updateDeleteCheckedButton();
+    const cascadeIds = Array.from(collectCascadingPostIds(ids));
+    const total = cascadeIds.length;
+    const totalSafe = Math.max(1, total);
+    let processed = 0;
+    let successCount = 0;
+    const failed = [];
+    setStatus(`Deleting ${total} post${total === 1 ? "" : "s"}...`);
+    showDeleteProgress(`Deleting 0/${total}`, 0);
+    await runPool(
+      cascadeIds,
+      Math.min(6, Math.max(3, Number(navigator.hardwareConcurrency) || 4)),
+      async (postId) => {
+        const result = await deletePostWithRetry(postId, 2);
+        processed += 1;
+        if (result && result.ok) {
+          successCount += 1;
+          animateThumbRemoval(postId);
+        } else {
+          failed.push(postId);
+        }
+        showDeleteProgress(`Deleting ${processed}/${total}`, processed / totalSafe);
+      }
+    );
+    const removedIds = new Set(cascadeIds.filter((id) => !failed.includes(id)));
+    if (removedIds.size) {
+      removedIds.forEach((id) => {
+        const norm = normalizeId(id);
+        if (norm) pendingDeleteMarkers.add(String(norm));
+      });
+      invalidateGroupsMemo();
+    }
+    state.selectedPostIds.clear();
+    const lightboxOpenNow = Boolean(lightboxEl && lightboxEl.classList.contains("open"));
+    if (lightboxOpenNow) {
+      updateItems();
+      if (!state.items.length) {
+        closeLightbox();
+      } else {
+        state.selectedIndex = Math.min(state.selectedIndex, Math.max(0, state.items.length - 1));
+        loadPlayer();
+      }
+    } else {
+      applyBlurToMarkedThumbs();
+    }
+    state.busy = false;
+    if (failed.length) {
+      setStatus(`Failed ${failed.length} deletion${failed.length === 1 ? "" : "s"}.`);
+      showToast("Some deletions failed.", "error");
+    } else if (successCount > 0) {
+      setStatus(successCount === 1 ? "Post deleted." : `${successCount} posts deleted.`);
+      showDeleteDone("Deleted");
+    } else {
+      setStatus("No posts deleted.");
+    }
+    hideDownloadProgress(0);
+    updateActionButtons();
+    updateDeleteCheckedButton();
   };
 
   const crcTable = (() => {
@@ -3932,6 +4568,8 @@
   let refreshBtn;
   let downloadAllBtn;
   let deleteAllBtn;
+  let deleteCheckedBtn;
+  let downloadCheckedBtn;
   let hideModToastToggle;
   let downloadReadyEl;
   let downloadReadyAudio;
@@ -3968,6 +4606,83 @@
   let bulk500Btn;
   let autoRefreshAlwaysCheck;
   let autoRefreshTimer = null;
+  let autoRefreshFailures = 0;
+  let autoRefreshLastFetchStatus = 0;
+  const groupsMemoStamp = { videos: 0, images: 0 };
+  const groupsMemoFor = { videos: -1, images: -1 };
+  const groupsMemoResult = { videos: null, images: null };
+  const invalidateGroupsMemo = (mode) => {
+    if (mode === "videos" || mode === "images") {
+      groupsMemoStamp[mode] += 1;
+      return;
+    }
+    groupsMemoStamp.videos += 1;
+    groupsMemoStamp.images += 1;
+  };
+  const pendingDeleteMarkers = new Set();
+  const applyBlurToMarkedThumbs = () => {
+    if (!gridEl || !pendingDeleteMarkers.size) return;
+    const thumbs = gridEl.querySelectorAll(".thumb[data-index]");
+    thumbs.forEach((thumbNode) => {
+      const thumb = thumbNode instanceof HTMLElement ? thumbNode : null;
+      if (!thumb) return;
+      const idx = Number(thumb.dataset.index);
+      if (!Number.isFinite(idx) || idx < 0 || idx >= state.items.length) return;
+      const item = state.items[idx];
+      if (!item) return;
+      const variants = item.variants && item.variants.length ? item.variants : [item];
+      const allMarked = variants.every((v) => {
+        const pid = v && v.postId ? String(v.postId) : "";
+        return pid && pendingDeleteMarkers.has(pid);
+      });
+      if (allMarked) thumb.classList.add("deleted-blurry");
+    });
+  };
+  const flushPendingDeletes = () => {
+    if (!pendingDeleteMarkers.size) return;
+    ["videos", "images"].forEach((mode) => {
+      const modeState = getModeState(mode);
+      let anyChange = false;
+      modeState.pageCache.forEach((pageItems, key) => {
+        const before = pageItems || [];
+        const filtered = before.filter((entry) => {
+          const pid = entry && entry.postId ? String(entry.postId) : "";
+          return !pid || !pendingDeleteMarkers.has(pid);
+        });
+        if (filtered.length !== before.length) {
+          modeState.pageCache.set(key, filtered);
+          anyChange = true;
+        }
+      });
+      if (!anyChange) return;
+      const rebuiltSeen = new Set();
+      let rebuiltTotal = 0;
+      modeState.pageCache.forEach((pageItems) => {
+        (pageItems || []).forEach((entry) => {
+          if (!entry) return;
+          rebuiltTotal += 1;
+          if (mode === "videos") {
+            const keys = getVideoDedupKeys(entry);
+            keys.forEach((key) => {
+              if (key) rebuiltSeen.add(key);
+            });
+          } else {
+            const key = getImageKey(entry);
+            if (key) rebuiltSeen.add(key);
+          }
+        });
+      });
+      modeState.seen = rebuiltSeen;
+      modeState.totalLoaded = rebuiltTotal;
+      const cachedPages = Array.from(modeState.pageCache.keys()).filter((page) => {
+        const pageItems = modeState.pageCache.get(page) || [];
+        return pageItems.length > 0;
+      });
+      modeState.maxPageLoaded = cachedPages.length ? Math.max(...cachedPages) : -1;
+      invalidateGroupsMemo(mode);
+    });
+    pendingDeleteMarkers.clear();
+  };
   let duplicateModal;
   let duplicateClose;
   let duplicateMessageEl;
@@ -4076,19 +4791,21 @@
   let regenCooldownTimer = null;
   let pendingRefreshAfterDelete = false;
 
+  const getCountSummary = () => {
+    let totalPosts = 0;
+    try {
+      totalPosts = computeAllUnifiedItems().length;
+    } catch (error) {
+      totalPosts = state.items.length;
+    }
+    const videoTotal = getModeState("videos").totalLoaded || 0;
+    return { totalPosts, videoTotal };
+  };
+
   const updateCount = () => {
-    const modeState = getModeState(state.mode);
-    const total = modeState.totalLoaded || state.items.length;
-    if (countEl) {
-      const label = state.mode === "images" ? "image" : "video";
-      countEl.textContent = `Loaded ${total} ${label}${total === 1 ? "" : "s"}`;
-    }
-    if (statusEl) {
-      const current = (statusEl.textContent || "").trim();
-      if (!current || /^Ready\\b/i.test(current) || /^Press Refresh\\b/i.test(current) || /^Loaded\\b/i.test(current)) {
-        statusEl.textContent = getReadyStatus();
-      }
-    }
+    const { totalPosts, videoTotal } = getCountSummary();
+    const text = `${totalPosts} post${totalPosts === 1 ? "" : "s"} · ${videoTotal} video${videoTotal === 1 ? "" : "s"}`;
+    if (countEl) countEl.textContent = text;
     if (lightboxCountEl) {
       const pageTotal = state.items.length;
       const current = pageTotal ? state.selectedIndex + 1 : 0;
@@ -4097,10 +4814,7 @@
   };
 
   const getReadyStatus = () => {
-    const modeState = getModeState(state.mode);
-    const total = modeState.totalLoaded || state.items.length;
-    const label = state.mode === "images" ? "images" : "videos";
-    return `Loaded ${total} ${label}`;
+    return "Ready";
   };
 
   const setReadyStatus = () => {
@@ -6394,6 +7108,10 @@
 
   const setViewMode = (mode, persist) => {
     if (mode !== "grid" && mode !== "normal") return;
+    if (state.viewMode !== mode) {
+      state.pageByMode.videos = 0;
+      state.pageByMode.images = 0;
+    }
     state.viewMode = mode;
     if (mode !== "grid") state.autoAdvanceAll = false;
     if (persist) chrome.storage.local.set({ [VIEW_MODE_KEY]: mode });
@@ -6582,6 +7300,17 @@
     if (activePostId) regenState.activePostId = activePostId;
     const canDelete = Boolean(activeItem && activeItem.postId);
     const isImages = state.mode === "images";
+    {
+      const checkedCount = state.selectedPostIds.size;
+      if (deleteCheckedBtn) {
+        deleteCheckedBtn.textContent = checkedCount > 0 ? `Delete Checked (${checkedCount})` : "Delete Checked";
+        deleteCheckedBtn.disabled = checkedCount === 0 || state.busy;
+      }
+      if (downloadCheckedBtn) {
+        downloadCheckedBtn.textContent = checkedCount > 0 ? `Download Checked (${checkedCount})` : "Download Checked";
+        downloadCheckedBtn.disabled = checkedCount === 0 || state.busy;
+      }
+    }
     const regenContext = selected ? buildRegenContext(selected, null) : null;
     const activeJob = getRegenJob(activePostId);
     const activeRunning = Boolean(activeJob && activeJob.running);
@@ -6828,7 +7557,7 @@
     if (!state.items.length) {
       if (emptyEl) emptyEl.classList.add("show");
       const emptyTitle = emptyEl ? emptyEl.querySelector("h2") : null;
-      if (emptyTitle) emptyTitle.textContent = state.mode === "images" ? "No images yet" : "No videos yet";
+      if (emptyTitle) emptyTitle.textContent = "Nothing here yet";
       updateCount();
       updateActionButtons();
       return;
@@ -6864,7 +7593,8 @@
           newRibbon.textContent = "NEW";
           thumb.appendChild(newRibbon);
         }
-        if (mode === "videos") {
+        const itemKind = (displayItem && displayItem.kind) || (state.mode === "images" ? "image" : "video");
+        if (itemKind === "video") {
           if (isHdVideoItem(displayItem)) {
             const hdTag = document.createElement("span");
             hdTag.className = "thumb-hd-tag";
@@ -6877,7 +7607,16 @@
         thumb.setAttribute("role", "button");
         thumb.tabIndex = 0;
 
-        if (mode === "images") {
+        if (pendingDeleteMarkers.size) {
+          const variants = item && item.variants && item.variants.length ? item.variants : [item];
+          const allMarked = variants.every((v) => {
+            const pid = v && v.postId ? String(v.postId) : "";
+            return pid && pendingDeleteMarkers.has(pid);
+          });
+          if (allMarked) thumb.classList.add("deleted-blurry");
+        }
+
+        if (itemKind === "image") {
           const img = document.createElement("img");
           img.src = optimizeThumbUrl(displayItem.url, { imageGridLow: true });
           img.alt = "Generated image";
@@ -6996,6 +7735,23 @@
         thumb.appendChild(regenMini);
         applyThumbRegenState(thumb);
 
+        const checkBox = document.createElement("div");
+        checkBox.className = "thumb-check";
+        checkBox.dataset.action = "toggle-check";
+        checkBox.dataset.index = String(index);
+        if (displayItem && displayItem.postId) checkBox.dataset.postId = displayItem.postId;
+        checkBox.setAttribute("role", "checkbox");
+        checkBox.tabIndex = 0;
+        const isChecked = !!(displayItem && displayItem.postId && state.selectedPostIds.has(String(displayItem.postId)));
+        if (isChecked) {
+          checkBox.classList.add("checked");
+          thumb.classList.add("selected");
+          checkBox.setAttribute("aria-checked", "true");
+        } else {
+          checkBox.setAttribute("aria-checked", "false");
+        }
+        thumb.appendChild(checkBox);
+
         if (item && item.variants && item.variants.length > 1) {
           thumb.classList.add("has-group-badge");
           const badge = document.createElement("div");
@@ -7003,7 +7759,8 @@
           thumb.appendChild(badge);
         }
 
-        if (isItemDownloaded(mode, displayItem)) {
+        const itemDownloadedMode = itemKind === "image" ? "images" : "videos";
+        if (isItemDownloaded(itemDownloadedMode, displayItem)) {
           const downloadedBadge = document.createElement("div");
           downloadedBadge.className = "downloaded-badge";
           downloadedBadge.textContent = "✓";
@@ -7018,25 +7775,6 @@
         statusChip.className = "thumb-status";
         const actions = document.createElement("div");
         actions.className = "thumb-actions";
-
-        const downloadAction = document.createElement("button");
-        downloadAction.type = "button";
-        downloadAction.className = "icon-btn download";
-        downloadAction.title = "Download";
-        downloadAction.dataset.tooltip = "Download";
-        downloadAction.appendChild(buildIcon("images/thumbnail/download.svg", "Download"));
-        downloadAction.dataset.action = "download";
-        downloadAction.dataset.index = String(index);
-
-        const shareAction = document.createElement("button");
-        shareAction.type = "button";
-        shareAction.className = "icon-btn share";
-        shareAction.title = displayItem.postId ? "Share" : "Share unavailable";
-        shareAction.dataset.tooltip = "Share";
-        shareAction.appendChild(buildIcon("images/thumbnail/share.svg", "Share"));
-        shareAction.dataset.action = "share";
-        shareAction.dataset.index = String(index);
-        if (!displayItem.postId || state.busy) shareAction.disabled = true;
 
         const deleteAction = document.createElement("button");
         deleteAction.type = "button";
@@ -7057,10 +7795,30 @@
         promptAction.dataset.action = "prompt";
         promptAction.dataset.index = String(index);
 
-        actions.appendChild(downloadAction);
-        actions.appendChild(shareAction);
-        actions.appendChild(deleteAction);
+        const downloadVideosAction = document.createElement("button");
+        downloadVideosAction.type = "button";
+        downloadVideosAction.className = "icon-btn download";
+        downloadVideosAction.title = "Download all videos and image under this post";
+        downloadVideosAction.dataset.tooltip = "Download all videos and image under this post";
+        downloadVideosAction.appendChild(buildIcon("images/compilation.svg", "Download all media"));
+        downloadVideosAction.dataset.action = "download-videos";
+        downloadVideosAction.dataset.index = String(index);
+        if (state.busy) downloadVideosAction.disabled = true;
+
+        const deleteVideosAction = document.createElement("button");
+        deleteVideosAction.type = "button";
+        deleteVideosAction.className = "icon-btn danger";
+        deleteVideosAction.title = "Delete all videos under this post";
+        deleteVideosAction.dataset.tooltip = "Delete all videos under this post";
+        deleteVideosAction.appendChild(buildIcon("images/thumbnail/close.svg", "Delete all videos"));
+        deleteVideosAction.dataset.action = "delete-videos";
+        deleteVideosAction.dataset.index = String(index);
+        if (state.busy) deleteVideosAction.disabled = true;
+
         actions.appendChild(promptAction);
+        actions.appendChild(downloadVideosAction);
+        actions.appendChild(deleteVideosAction);
+        actions.appendChild(deleteAction);
         overlay.appendChild(statusChip);
         overlay.appendChild(actions);
         thumb.appendChild(overlay);
@@ -7410,8 +8168,9 @@
     }
     const item = resolveActiveItem(group);
     if (!item) return;
+    const lightboxItemKind = (item && item.kind) || (state.mode === "images" ? "image" : "video");
     if (lightboxHdTag) {
-      const showHd = state.mode === "videos" && isHdVideoItem(item);
+      const showHd = lightboxItemKind === "video" && isHdVideoItem(item);
       lightboxHdTag.classList.toggle("show", showHd);
     }
     const clearPendingPlayerLoadHooks = () => {
@@ -7421,7 +8180,7 @@
       } catch (error) {}
       clearPlayerLoadHooks = null;
     };
-    const isImages = state.mode === "images" && item.url && isImage(item.url, item.mimeType);
+    const isImages = lightboxItemKind === "image" && item.url && isImage(item.url, item.mimeType);
     if (isImages) {
       clearPendingPlayerLoadHooks();
       if (lightboxEl) lightboxEl.classList.remove("gv-landscape-video");
@@ -8061,6 +8820,8 @@ const initHideModToastTooltip = () => {};
     refreshBtn = shadow.querySelector("#refreshBtn");
     downloadAllBtn = shadow.querySelector("#downloadAllBtn");
     deleteAllBtn = shadow.querySelector("#deleteAllBtn");
+    deleteCheckedBtn = shadow.querySelector("#deleteCheckedBtn");
+    downloadCheckedBtn = shadow.querySelector("#downloadCheckedBtn");
     tabVideosBtn = shadow.querySelector("#tabVideos");
     tabImagesBtn = shadow.querySelector("#tabImages");
     prevPageBtn = shadow.querySelector("#prevPageBtn");
@@ -8191,7 +8952,7 @@ const initHideModToastTooltip = () => {};
     if (regenProgressTextEl) regenProgressTextEl.textContent = "0%";
     updateRegenDebugPanel();
 
-    if (refreshBtn) refreshBtn.onclick = refresh;
+    if (refreshBtn) refreshBtn.onclick = refreshCurrentPage;
     if (downloadAllBtn) downloadAllBtn.onclick = downloadAll;
     if (progressStopBtn) {
       progressStopBtn.onclick = () => {
@@ -8199,6 +8960,8 @@ const initHideModToastTooltip = () => {};
       };
     }
     if (deleteAllBtn) deleteAllBtn.onclick = deleteAll;
+    if (deleteCheckedBtn) deleteCheckedBtn.onclick = deleteCheckedItems;
+    if (downloadCheckedBtn) downloadCheckedBtn.onclick = downloadCheckedItems;
     if (downloadGroupBtn)
       downloadGroupBtn.onclick = () => {
         spinButtonIcon(downloadGroupBtn);
@@ -8294,6 +9057,28 @@ const initHideModToastTooltip = () => {};
     }
     if (gridEl) {
       gridEl.addEventListener("click", (event) => {
+        const checkBox = event.target && event.target.closest ? event.target.closest(".thumb-check") : null;
+        if (checkBox && gridEl.contains(checkBox)) {
+          event.preventDefault();
+          event.stopPropagation();
+          const postId = checkBox.dataset.postId || "";
+          if (!postId) return;
+          if (state.selectedPostIds.has(postId)) {
+            state.selectedPostIds.delete(postId);
+            checkBox.classList.remove("checked");
+            checkBox.setAttribute("aria-checked", "false");
+            const t = checkBox.closest(".thumb");
+            if (t) t.classList.remove("selected");
+          } else {
+            state.selectedPostIds.add(postId);
+            checkBox.classList.add("checked");
+            checkBox.setAttribute("aria-checked", "true");
+            const t = checkBox.closest(".thumb");
+            if (t) t.classList.add("selected");
+          }
+          updateDeleteCheckedButton();
+          return;
+        }
         const actionBtn = event.target && event.target.closest ? event.target.closest("button.icon-btn") : null;
         if (actionBtn && gridEl.contains(actionBtn)) {
           event.preventDefault();
@@ -8303,16 +9088,15 @@ const initHideModToastTooltip = () => {};
           if (!item || state.busy) return;
           const action = actionBtn.dataset.action || "";
           spinButtonIcon(actionBtn);
-          if (action === "download") {
-            playActionAudio("download");
-            downloadFile(item);
-          }
-          if (action === "share") {
-            playActionAudio("share");
-            shareItem(item);
-          }
           if (action === "delete") deleteItem(item);
           if (action === "prompt") handlePromptItem(item, { source: "thumb", trigger: actionBtn });
+          if (action === "download-videos") {
+            playActionAudio("download");
+            downloadAllVideosForItem(item);
+          }
+          if (action === "delete-videos") {
+            deleteAllVideosForItem(item);
+          }
           return;
         }
         const thumbBtn = event.target && event.target.closest ? event.target.closest(".thumb") : null;
@@ -8346,6 +9130,7 @@ const initHideModToastTooltip = () => {};
         state.sortOrder = state.sortOrder === "asc" ? "desc" : "asc";
         state.groupOrder = new Map();
         state.groupLatest = new Map();
+        invalidateGroupsMemo();
         state.items = computeCurrentItems();
         applyModeUI();
         renderGrid();
@@ -8754,6 +9539,7 @@ const initHideModToastTooltip = () => {};
         });
         modeState.totalLoaded = pageItems.length;
         modeState.maxPageLoaded = pageItems.length ? 0 : -1;
+        invalidateGroupsMemo("videos");
         updateItems();
         setReadyStatus();
       }
@@ -8762,6 +9548,23 @@ const initHideModToastTooltip = () => {};
     });
     debug("initUI setup complete");
   };
+
+  try {
+    window.__gvDebug = {
+      state,
+      computeAllGroupsForMode,
+      computeAllUnifiedItems,
+      computeCurrentItems,
+      getModeState,
+      invalidateGroupsMemo,
+      groupItems,
+      dedupeImageItems,
+      sortByCreatedAt,
+      groupsMemoStamp,
+      groupsMemoFor,
+      groupsMemoResult
+    };
+  } catch (error) {}
 
   initUI()
     .then(() => {
