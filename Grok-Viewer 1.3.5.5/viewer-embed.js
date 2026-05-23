@@ -4161,14 +4161,39 @@
     if (state.busy) return;
     const ready = await ensureFolderModeReady();
     if (!ready) return;
-    const groups = computeAllUnifiedItems();
-    if (!groups.length) {
-      showToast("No posts to download.", "info");
-      return;
-    }
     state.busy = true;
     updateActionButtons();
     showDownloadProgress();
+    setStatus("Loading all pages...");
+    try {
+      const exhaustOne = async (mode) => {
+        const ms = getModeState(mode);
+        let safety = 0;
+        while (!ms.exhausted && safety < 2000) {
+          const fetchIndex = ms.pageCursors.length - 1;
+          await fetchAndCachePage(mode, fetchIndex);
+          safety += 1;
+        }
+      };
+      await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
+    } catch (error) {
+      state.busy = false;
+      hideDownloadProgress(0);
+      updateActionButtons();
+      setStatus("Failed to load all pages.");
+      showToast("Failed to load all pages.", "error");
+      return;
+    }
+    invalidateGroupsMemo();
+    updateItems();
+    const groups = computeAllUnifiedItems();
+    if (!groups.length) {
+      state.busy = false;
+      hideDownloadProgress(0);
+      updateActionButtons();
+      showToast("No posts to download.", "info");
+      return;
+    }
     setStatus(`Downloading ${groups.length} post${groups.length === 1 ? "" : "s"}...`);
     let succeeded = 0;
     const skipped = [];
