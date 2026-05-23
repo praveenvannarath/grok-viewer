@@ -2245,53 +2245,6 @@
     return next;
   };
 
-  const collectBulkItems = async (mode, targetCount) => {
-    if (!state.downloadedLookup || !state.downloadedLookup[mode]) {
-      await loadDownloadedLookup();
-    }
-    const downloaded = state.downloadedLookup && state.downloadedLookup[mode] ? state.downloadedLookup[mode] : new Set();
-    const modeState = getModeState(mode);
-    const pageStart = isGridMode() ? 0 : clampPage(mode);
-    const maxItems = Math.max(1, targetCount);
-    const fresh = [];
-    const duplicates = [];
-    let dupCount = 0;
-    let page = pageStart;
-    let safety = 0;
-    while (fresh.length < maxItems && safety < 500) {
-      if (!modeState.pageCache.has(page)) {
-        if (modeState.pageCursors[page] !== undefined) {
-          await fetchAndCachePage(mode, page);
-        } else {
-          while (modeState.pageCursors.length <= page && !modeState.exhausted) {
-            const fetchIndex = modeState.pageCursors.length - 1;
-            await fetchAndCachePage(mode, fetchIndex);
-          }
-          if (modeState.pageCursors[page] !== undefined && !modeState.pageCache.has(page)) {
-            await fetchAndCachePage(mode, page);
-          }
-        }
-      }
-      const pageItems = modeState.pageCache.get(page) || [];
-      for (let i = 0; i < pageItems.length; i += 1) {
-        const item = pageItems[i];
-        const key = mode === "images" ? getImageKey(item) : getItemKey(item);
-        if (key && downloaded.has(key)) {
-          dupCount += 1;
-          if (duplicates.length < maxItems) duplicates.push(item);
-          continue;
-        }
-        fresh.push(item);
-        if (fresh.length >= maxItems) break;
-      }
-      if (modeState.exhausted && page >= modeState.maxPageLoaded) break;
-      page += 1;
-      safety += 1;
-    }
-    prunePageCache(mode, pageStart);
-    return { fresh, dupCount, duplicates };
-  };
-
   const updatePager = () => {
     if (!prevPageBtn || !nextPageBtn || !pageInfoEl) return;
     const pageCount = getPageCount(state.mode);
@@ -4205,358 +4158,63 @@
   };
 
   const downloadAll = async () => {
-    if (state.busy || !state.items.length) return;
+    if (state.busy) return;
     const ready = await ensureFolderModeReady();
     if (!ready) return;
-    const isImages = state.mode === "images";
-    addBulkDebug("downloadAll click", `mode=${state.mode} items=${state.items.length} target=${getBulkTarget()}`);
+    const groups = computeAllUnifiedItems();
+    if (!groups.length) {
+      showToast("No posts to download.", "info");
+      return;
+    }
     state.busy = true;
     updateActionButtons();
-    const mode = state.mode;
-    const bulkTarget = getBulkTarget();
-    const { fresh, dupCount, duplicates } = await collectBulkItems(mode, bulkTarget);
-    addBulkDebug(
-      "collectBulkItems",
-      `mode=${mode} fresh=${fresh.length} dupCount=${dupCount} dupSample=${(duplicates && duplicates.length) || 0}`
-    );
-    if (dupCount) showDuplicateModal("Some files were already downloaded once, I’ll only download the new ones.");
-    let selectedItems = fresh;
-    if (!fresh.length && dupCount) {
-      setStatus("All files already downloaded.");
-      const redownload = await askDuplicateModal(
-        "All your files have already been downloaded. Wanna download them again?",
-        10
-      );
-      hideDuplicateModal();
-      if (!redownload) {
-        state.busy = false;
-        hideDownloadProgress(0);
-        updateActionButtons();
-        return;
+    showDownloadProgress();
+    setStatus(`Downloading ${groups.length} post${groups.length === 1 ? "" : "s"}...`);
+    let succeeded = 0;
+    const skipped = [];
+    try {
+      for (let i = 0; i < groups.length; i += 1) {
+        const group = groups[i];
+        const seedIds = group && group.variants && group.variants.length
+          ? group.variants.map((v) => v && v.postId).filter(Boolean)
+          : (group && group.postId ? [group.postId] : []);
+        if (!seedIds.length) {
+          skipped.push(i);
+          continue;
+        }
+        const media = collectMediaForPostIds(seedIds);
+        if (!media.length) {
+          skipped.push(i);
+          continue;
+        }
+        setStatus(`Downloading post ${i + 1} of ${groups.length}...`);
+        try {
+          if (media.length === 1) {
+            await downloadFile(media[0]);
+          } else {
+            await downloadGroup({ variants: media }, { skipFinalWait: true });
+          }
+          succeeded += 1;
+        } catch (error) {
+          skipped.push(i);
+        }
+        if (i < groups.length - 1) {
+          await sleep(150);
+        }
       }
-      selectedItems = (duplicates || []).slice(0, Math.max(1, bulkTarget));
-    }
-    if (!selectedItems.length) {
-      setStatus("All files already downloaded.");
-      showDuplicateModal("All your files have already been downloaded. Wanna download them again?");
+    } finally {
       state.busy = false;
       hideDownloadProgress(0);
       updateActionButtons();
-      return;
     }
-    const bulkCount = selectedItems.length;
-    const bulkLabel = isImages
-      ? `Download (${bulkCount}) images in bulk`
-      : `Download (${bulkCount}) videos in bulk`;
-    addBulkDebug("bulk selection", `bulkCount=${bulkCount} label="${bulkLabel}"`);
-    setStatus(`${bulkLabel}...`);
-    showDownloadProgress();
-    const run = async () => {
-      let readyShown = false;
-      let retryRequested = false;
-      let stoppedByUser = false;
-      try {
-        setProgressCancelableAction("bulk-download");
-        const savePrompt = resolveSaveAs();
-        const total = selectedItems.length;
-        const fastBulk = state.settings && state.settings.fastBulk !== false;
-        const ultraBulkMode = Number(getBulkTarget()) >= 500 || total >= 420;
-        if (ultraBulkMode) {
-          state.thumbAutoplay = false;
-          state.autoAdvance = false;
-          state.autoAdvanceAll = false;
-          renderGrid();
-        }
-        const batchSize = fastBulk
-          ? ultraBulkMode
-            ? total > 420
-              ? 90
-              : total > 280
-              ? 75
-              : total > 150
-              ? 60
-              : Math.max(36, total)
-            : total > 140
-            ? 30
-            : total > 90
-            ? 25
-            : total > 50
-            ? 22
-            : total
-          : total > 80
-          ? 15
-          : total > 45
-          ? 20
-          : total;
-        const batches = [];
-        for (let i = 0; i < total; i += batchSize) {
-          batches.push(selectedItems.slice(i, i + batchSize));
-        }
-        addBulkDebug(
-          "bulk run start",
-          `total=${total} batchSize=${batchSize} batches=${batches.length} savePrompt=${savePrompt ? "yes" : "no"}`
-        );
-        const baseTime = Date.now();
-        for (let batchIndex = 0; batchIndex < batches.length; batchIndex += 1) {
-          if (isProgressCancelRequested("bulk-download")) {
-            stoppedByUser = true;
-            addBulkDebug("cancel requested before batch", `batch=${batchIndex + 1}`);
-            break;
-          }
-          const batch = batches[batchIndex];
-          const files = [];
-          const queue = batch.map((item) => ({ item, tries: 0, refreshed: false, candidates: buildDownloadCandidates(item) }));
-          const cpu = navigator.hardwareConcurrency || 6;
-          const baseConcurrency = ultraBulkMode
-            ? isImages
-              ? Math.min(24, Math.max(10, cpu + 3))
-              : Math.min(26, Math.max(12, cpu + 5))
-            : fastBulk
-            ? isImages
-              ? Math.min(14, Math.max(6, cpu))
-              : Math.min(16, Math.max(7, cpu + 1))
-            : Math.min(6, Math.max(3, cpu));
-          const concurrency = Math.min(baseConcurrency, batch.length || 1);
-          let completed = 0;
-          let failedCount = 0;
-          addBulkDebug(
-            "batch start",
-            `batch=${batchIndex + 1}/${batches.length} items=${batch.length} concurrency=${concurrency}`
-          );
-          const batchHeartbeat = setInterval(() => {
-            addBulkDebug(
-              "batch heartbeat",
-              `batch=${batchIndex + 1}/${batches.length} completed=${completed}/${batch.length} queue=${queue.length} failed=${failedCount}`
-            );
-          }, 5000);
-          const fetchOne = async () => {
-            while (queue.length) {
-              if (isProgressCancelRequested("bulk-download")) return;
-              const entry = queue.shift();
-              if (!entry || !entry.item) continue;
-              let response;
-              const candidates =
-                entry.candidates && entry.candidates.length ? entry.candidates.slice() : buildDownloadCandidates(entry.item);
-              addBulkDebug(
-                "item fetch start",
-                `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} try=${entry.tries} candidates=${candidates.length}`
-              );
-              try {
-                response = null;
-                let lastFetchError = "";
-                for (let c = 0; c < candidates.length; c += 1) {
-                  const candidateUrl = candidates[c];
-                  if (!candidateUrl) continue;
-                  try {
-                    const attempt = await fetchWithTimeout(candidateUrl, 120000);
-                    if (attempt && attempt.ok) {
-                      response = attempt;
-                      addBulkDebug(
-                        "item fetch ok",
-                        `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} url=${candidateUrl}`
-                      );
-                      break;
-                    }
-                    addBulkDebug(
-                      "item fetch non-ok",
-                      `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} status=${
-                        attempt ? attempt.status : 0
-                      } url=${candidateUrl}`
-                    );
-                    lastFetchError = `HTTP ${attempt ? attempt.status : 0} ${candidateUrl}`;
-                  } catch (error) {
-                    lastFetchError = String((error && error.message) || error || "fetch-failed");
-                    addBulkDebug(
-                      "item fetch exception",
-                      `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} url=${candidateUrl} error=${lastFetchError}`
-                    );
-                  }
-                }
-                if (!response || !response.ok) throw new Error(lastFetchError || `HTTP ${response ? response.status : 0}`);
-              } catch (error) {
-                addBulkDebug(
-                  "item fetch failed",
-                  `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} try=${entry.tries} error=${
-                    (error && error.message) || error || "unknown"
-                  }`
-                );
-                if (!entry.refreshed && entry.item && entry.item.postId) {
-                  const refreshedCandidates = await buildFreshDownloadCandidatesForItem(entry.item);
-                  if (refreshedCandidates.length) {
-                    addBulkDebug(
-                      "item refresh candidates",
-                      `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} candidates=${refreshedCandidates.length}`
-                    );
-                    queue.push({
-                      item: entry.item,
-                      tries: entry.tries + 1,
-                      refreshed: true,
-                      candidates: refreshedCandidates
-                    });
-                    await sleep(20);
-                    continue;
-                  }
-                }
-                if (entry.tries < 2) {
-                  addBulkDebug(
-                    "item retry queued",
-                    `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} nextTry=${entry.tries + 1}`
-                  );
-                  queue.push({
-                    item: entry.item,
-                    tries: entry.tries + 1,
-                    refreshed: entry.refreshed,
-                    candidates
-                  });
-                  await sleep(20);
-                  continue;
-                }
-                failedCount += 1;
-                setStatus(`${bulkLabel}...`);
-                await sleep(20);
-                continue;
-              }
-              const buffer = new Uint8Array(await response.arrayBuffer());
-              const { dosTime, dosDate } = toDosTimeDate(new Date());
-              const baseUrl = (entry.item.url || "").split(/[?#]/)[0];
-              const extMatch = baseUrl.match(/\.([a-z0-9]{2,6})$/i);
-              const ext = extMatch ? extMatch[1].toLowerCase() : isImages ? "jpg" : "mp4";
-              const name = `${entry.item.postId || entry.item.id}.${ext}`;
-              files.push({
-                name,
-                data: buffer,
-                size: buffer.length,
-                crc: crc32(buffer),
-                dosTime,
-                dosDate
-              });
-              completed += 1;
-              addBulkDebug(
-                "item packaged",
-                `batch=${batchIndex + 1} post=${entry.item.postId || entry.item.id || "n/a"} size=${buffer.length} completed=${completed}/${batch.length}`
-              );
-              const prepText = `${bulkLabel}...`;
-              setStatus(prepText);
-              setDownloadProgress(prepText, completed / batch.length);
-              if (failedCount && failedCount % 6 === 0) await sleep(15);
-            }
-          };
-          const workers = [];
-          for (let i = 0; i < concurrency; i += 1) {
-            workers.push(fetchOne());
-          }
-          try {
-            await Promise.all(workers);
-          } finally {
-            clearInterval(batchHeartbeat);
-          }
-          addBulkDebug(
-            "batch fetch complete",
-            `batch=${batchIndex + 1}/${batches.length} files=${files.length} failed=${failedCount} remainingQueue=${queue.length}`
-          );
-          if (isProgressCancelRequested("bulk-download")) {
-            stoppedByUser = true;
-            addBulkDebug("cancel requested after fetch", `batch=${batchIndex + 1}`);
-            break;
-          }
-          if (!files.length) continue;
-          const buildText = `${bulkLabel}...`;
-          setStatus(buildText);
-          setDownloadProgress(buildText, 1);
-          addBulkDebug("zip build start", `batch=${batchIndex + 1} files=${files.length}`);
-          const blob = buildZipBlob(files);
-          addBulkDebug("zip build done", `batch=${batchIndex + 1} blobSize=${blob.size}`);
-          const prefix = isImages ? "grok-images" : "grok-videos";
-          const archiveName =
-            batches.length > 1
-              ? `${prefix}-${baseTime}-part-${batchIndex + 1}.zip`
-              : `${prefix}-${baseTime}.zip`;
-          let started = await downloadBlobViaExtension(blob, archiveName);
-          addBulkDebug(
-            "archive start via extension",
-            `batch=${batchIndex + 1} ok=${started && started.ok ? "yes" : "no"} id=${
-              started && started.downloadId ? started.downloadId : 0
-            }`
-          );
-          let archiveVerify = await verifyDownloadResult(started, savePrompt ? 120000 : 15000, !!savePrompt);
-          addBulkDebug(
-            "archive verify",
-            `batch=${batchIndex + 1} ok=${archiveVerify.ok ? "yes" : "no"} state=${archiveVerify.state || "n/a"}`
-          );
-          if (!archiveVerify.ok) {
-            const directStarted = await downloadBlobDirect(blob, archiveName);
-            if (directStarted && directStarted.ok) {
-              started = directStarted;
-              archiveVerify = { ok: true, state: "direct", outcome: null };
-              addBulkDebug("archive direct fallback", `batch=${batchIndex + 1} ok=yes`);
-            } else {
-              addBulkDebug(
-                "archive direct fallback",
-                `batch=${batchIndex + 1} ok=no error=${(directStarted && directStarted.error) || "unknown"}`
-              );
-            }
-          }
-          if (!archiveVerify.ok) {
-            addBulkDebug(
-              "archive failed",
-              `batch=${batchIndex + 1} state=${archiveVerify.state || "n/a"} asking-retry=yes`
-            );
-            retryRequested = await askArchiveRetry("Archive download interrupted. Do you want to retry?");
-            if (!retryRequested) {
-              stoppedByUser = true;
-              if (archiveVerify.state === "canceled" || isDownloadCanceled(started)) maybePromptDownloadSetupGuide();
-            }
-            break;
-          }
-          if (savePrompt && archiveVerify.outcome) {
-            rememberAskEachFolderFromDownloadOutcome(archiveVerify.outcome, started.filename || archiveName);
-          }
-          recordDownloadedItems(state.mode, batch);
-          renderGrid();
-          const startText = `Downloading ${batchIndex + 1}/${batches.length} archive`;
-          setStatus(startText);
-          setDownloadProgress(startText, Math.min(1, (batchIndex + 1) / Math.max(1, batches.length)));
-          const effectiveName = started.filename || archiveName;
-          addBulkDebug("archive complete", `batch=${batchIndex + 1} filename=${effectiveName}`);
-          if (batchIndex < batches.length - 1) {
-            hideDownloadProgress(0);
-            showDownloadProgress();
-            setProgressCancelableAction("bulk-download");
-            setStatus(`${bulkLabel}...`);
-            setDownloadProgress(`${bulkLabel}...`, Math.min(1, (batchIndex + 1) / Math.max(1, batches.length)));
-          }
-          if (batchIndex === batches.length - 1) {
-            hideDownloadProgress(0);
-            showDownloadReady("Your file is ready. Click here", effectiveName);
-            readyShown = true;
-          }
-          if (batchIndex < batches.length - 1) await sleep(15);
-        }
-        if (stoppedByUser) {
-          setStatus("Download stopped.");
-          showToast("Download stopped.");
-          addBulkDebug("bulk run stop", "stoppedByUser=yes");
-        } else if (!readyShown && !retryRequested) {
-          setReadyStatus();
-          addBulkDebug("bulk run end", "readyShown=no retry=no setReadyStatus");
-        }
-      } catch (error) {
-        setStatus("Download all failed.");
-        addBulkDebug("bulk run exception", String((error && error.message) || error || "unknown"));
-      } finally {
-        hideDuplicateModal();
-        state.busy = false;
-        hideDownloadProgress(0);
-        updateActionButtons();
-        addBulkDebug("bulk run finally", `retryRequested=${retryRequested ? "yes" : "no"} stopped=${stoppedByUser ? "yes" : "no"}`);
-        if (retryRequested) {
-          setTimeout(() => {
-            downloadAll();
-          }, 120);
-        }
-      }
-    };
-    run();
+    if (succeeded === 0) {
+      showToast("No posts downloaded.", "error");
+    } else if (skipped.length) {
+      showToast(`${succeeded} of ${groups.length} posts downloaded; ${skipped.length} skipped.`, "info");
+    } else {
+      showToast(`${succeeded} post${succeeded === 1 ? "" : "s"} downloaded.`, "info");
+    }
+    setStatus(`Downloaded ${succeeded}/${groups.length} posts.`);
   };
 
   let root;
@@ -7252,9 +6910,7 @@
     if (downloadAllBtn) downloadAllBtn.textContent = "Download All";
     if (deleteAllBtn) deleteAllBtn.textContent = "Delete All";
     if (downloadAllBtn) {
-      downloadAllBtn.dataset.tooltip = isImages
-        ? "Download all your images."
-        : "Download all your videos.";
+      downloadAllBtn.dataset.tooltip = "Download every post as its own zip (videos + image).";
     }
     if (deleteAllBtn) {
       deleteAllBtn.dataset.tooltip = isImages ? "Delete all your images." : "Delete all your videos.";
@@ -7339,8 +6995,8 @@
       updateRegenButtonVisual();
     }
     if (downloadAllBtn) {
-      const hasItems = isImages ? state.imageItems.length : state.videoItems.length;
-      downloadAllBtn.disabled = !hasItems || state.busy;
+      const hasAny = state.videoItems.length || state.imageItems.length;
+      downloadAllBtn.disabled = !hasAny || state.busy;
     }
     if (deleteAllBtn) {
       const hasItems = isImages ? state.imageItems.length : state.videoItems.length;
