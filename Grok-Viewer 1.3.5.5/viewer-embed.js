@@ -3721,10 +3721,23 @@
           if (!response || !response.ok) continue;
           const buffer = new Uint8Array(await response.arrayBuffer());
           const { dosTime, dosDate } = toDosTimeDate(new Date());
-          const baseUrl = (item.url || "").split(/[?#]/)[0];
-          const extMatch = baseUrl.match(/\\.([a-z0-9]{2,6})$/i);
-          const itemIsImage = item && item.kind === "image";
-          const ext = extMatch ? extMatch[1].toLowerCase() : (itemIsImage || isImages) ? "jpg" : "mp4";
+          const itemIsImage =
+            (item && item.kind === "image") ||
+            (item && isImage(item.url, item.mimeType));
+          const fetchedUrl = (response && response.url) || (item && item.url) || "";
+          const baseUrl = String(fetchedUrl).split(/[?#]/)[0];
+          const extMatch = baseUrl.match(/\.([a-z0-9]{2,6})$/i);
+          const urlExt = extMatch ? extMatch[1].toLowerCase() : "";
+          const videoExts = new Set(["mp4", "m4v", "mov", "webm"]);
+          const imageExts = new Set(["jpg", "jpeg", "png", "webp", "gif", "avif"]);
+          let ext;
+          if (itemIsImage) {
+            ext = imageExts.has(urlExt) ? urlExt : "jpg";
+          } else if (urlExt && videoExts.has(urlExt)) {
+            ext = urlExt;
+          } else {
+            ext = isImages ? "jpg" : "mp4";
+          }
           const name = `${item.postId || item.id}.${ext}`;
           files.push({
             name,
