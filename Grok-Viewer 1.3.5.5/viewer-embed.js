@@ -3933,6 +3933,36 @@
     }
   };
 
+  const getCurrentPagePostIds = () => {
+    const ids = [];
+    const items = state.items || [];
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      if (!item) continue;
+      if (item.postId) ids.push(String(item.postId));
+      const variants = Array.isArray(item.variants) ? item.variants : [];
+      for (let j = 0; j < variants.length; j += 1) {
+        const v = variants[j];
+        if (v && v.postId) ids.push(String(v.postId));
+      }
+    }
+    return Array.from(new Set(ids));
+  };
+
+  const toggleCheckAllCurrentPage = () => {
+    if (state.busy) return;
+    const ids = getCurrentPagePostIds();
+    if (!ids.length) return;
+    const allChecked = ids.every((id) => state.selectedPostIds.has(id));
+    if (allChecked) {
+      ids.forEach((id) => state.selectedPostIds.delete(id));
+    } else {
+      ids.forEach((id) => state.selectedPostIds.add(id));
+    }
+    renderGrid();
+    updateActionButtons();
+  };
+
   const collectMediaForPostIds = (postIds) => {
     const allIds = collectCascadingPostIds(postIds);
     const seen = new Set();
@@ -4253,6 +4283,7 @@
   let deleteAllBtn;
   let deleteCheckedBtn;
   let downloadCheckedBtn;
+  let checkAllBtn;
   let hideModToastToggle;
   let downloadReadyEl;
   let downloadReadyAudio;
@@ -6991,6 +7022,15 @@
         downloadCheckedBtn.textContent = checkedCount > 0 ? `Download Checked (${checkedCount})` : "Download Checked";
         downloadCheckedBtn.disabled = checkedCount === 0 || state.busy;
       }
+      if (checkAllBtn) {
+        const pageIds = getCurrentPagePostIds();
+        const allChecked = pageIds.length > 0 && pageIds.every((id) => state.selectedPostIds.has(id));
+        checkAllBtn.textContent = allChecked ? "Uncheck All" : "Check All";
+        checkAllBtn.dataset.tooltip = allChecked
+          ? "Uncheck every post on this page."
+          : "Check every post on this page.";
+        checkAllBtn.disabled = pageIds.length === 0 || state.busy;
+      }
     }
     const regenContext = selected ? buildRegenContext(selected, null) : null;
     const activeJob = getRegenJob(activePostId);
@@ -8503,6 +8543,7 @@ const initHideModToastTooltip = () => {};
     deleteAllBtn = shadow.querySelector("#deleteAllBtn");
     deleteCheckedBtn = shadow.querySelector("#deleteCheckedBtn");
     downloadCheckedBtn = shadow.querySelector("#downloadCheckedBtn");
+    checkAllBtn = shadow.querySelector("#checkAllBtn");
     tabVideosBtn = shadow.querySelector("#tabVideos");
     tabImagesBtn = shadow.querySelector("#tabImages");
     prevPageBtn = shadow.querySelector("#prevPageBtn");
@@ -8643,6 +8684,7 @@ const initHideModToastTooltip = () => {};
     if (deleteAllBtn) deleteAllBtn.onclick = deleteAll;
     if (deleteCheckedBtn) deleteCheckedBtn.onclick = deleteCheckedItems;
     if (downloadCheckedBtn) downloadCheckedBtn.onclick = downloadCheckedItems;
+    if (checkAllBtn) checkAllBtn.onclick = toggleCheckAllCurrentPage;
     if (downloadGroupBtn)
       downloadGroupBtn.onclick = () => {
         spinButtonIcon(downloadGroupBtn);
