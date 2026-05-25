@@ -3572,9 +3572,10 @@
     if (!saveAs) await waitForDownloadWithTimeout(effectiveName, true, 20000);
   };
 
-  const downloadFile = async (item) => {
+  const downloadFile = async (item, options) => {
     const targetItem = resolveActiveItem(item);
     if (!targetItem) return;
+    const skipDuplicatePrompt = !!(options && options.skipDuplicatePrompt);
     try {
       const candidates = buildDownloadCandidates(targetItem);
       const targetUrl = candidates[0] || "";
@@ -3586,7 +3587,7 @@
       const ready = await ensureFolderModeReady();
       if (!ready) return;
       const alreadyDownloaded = isItemDownloaded(state.mode, targetItem);
-      if (alreadyDownloaded) {
+      if (alreadyDownloaded && !skipDuplicatePrompt) {
         const again = window.confirm("This file has already been downloaded. Do you want to download it again?");
         if (!again) return;
       }
@@ -4023,7 +4024,7 @@
       setStatus(`Downloading post ${i + 1} of ${ids.length}...`);
       try {
         if (media.length === 1) {
-          await downloadFile(media[0]);
+          await downloadFile(media[0], { skipDuplicatePrompt: true });
         } else {
           await downloadGroup({ variants: media }, { skipFinalWait: true });
         }
@@ -4269,7 +4270,7 @@
         setStatus(`Downloading post ${i + 1} of ${groups.length}...`);
         try {
           if (media.length === 1) {
-            await downloadFile(media[0]);
+            await downloadFile(media[0], { skipDuplicatePrompt: true });
           } else {
             await downloadGroup({ variants: media }, { skipFinalWait: true });
           }
