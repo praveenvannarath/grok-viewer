@@ -3451,8 +3451,19 @@
     const targetUrl = candidates[0] || targetItem.url || "";
     const baseUrl = String(targetUrl || "").split(/[?#]/)[0];
     const extMatch = baseUrl.match(/\.([a-z0-9]{2,6})$/i);
-    const fallbackExt = isImage(targetItem.url, targetItem.mimeType) ? "jpg" : "mp4";
-    const ext = extMatch ? extMatch[1].toLowerCase() : fallbackExt;
+    const urlExt = extMatch ? extMatch[1].toLowerCase() : "";
+    const videoExts = new Set(["mp4", "m4v", "mov", "webm"]);
+    const imageExts = new Set(["jpg", "jpeg", "png", "webp", "gif", "avif"]);
+    const itemIsImage =
+      targetItem.kind === "image" || isImage(targetItem.url, targetItem.mimeType);
+    let ext;
+    if (itemIsImage) {
+      ext = imageExts.has(urlExt) ? urlExt : "jpg";
+    } else if (urlExt && videoExts.has(urlExt)) {
+      ext = urlExt;
+    } else {
+      ext = "mp4";
+    }
     const filenameBase = targetItem.postId || targetItem.id || "grok-media";
     return `${filenameBase}.${ext}`;
   };
