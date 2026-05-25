@@ -3684,13 +3684,17 @@
 
   const downloadGroup = async (groupArg, options) => {
     const group = groupArg || state.items[state.selectedIndex];
-    if (!group || !group.variants || group.variants.length <= 1 || state.busy) return;
     const skipFinalWait = !!(options && options.skipFinalWait);
+    const bulk = !!(options && options.bulk);
+    if (!group || !group.variants || group.variants.length <= 1) return;
+    if (!bulk && state.busy) return;
     const ready = await ensureFolderModeReady();
     if (!ready) return;
     const isImages = state.mode === "images";
-    state.busy = true;
-    updateActionButtons();
+    if (!bulk) {
+      state.busy = true;
+      updateActionButtons();
+    }
     setStatus("Preparing compilation...");
     showDownloadProgress();
     if (downloadGroupBtn) {
@@ -3798,17 +3802,21 @@
         setDownloadProgress(startText, 0);
         const effectiveName = started.filename || archiveName;
         showDownloadReady("Your file is ready. Click here", effectiveName);
-        state.busy = false;
-        updateActionButtons();
+        if (!bulk) {
+          state.busy = false;
+          updateActionButtons();
+        }
         if (!skipFinalWait) {
           await waitForDownloadWithTimeout(effectiveName, true, 20000);
         }
       } catch (error) {
         setStatus("Download failed.");
       } finally {
-        state.busy = false;
-        hideDownloadProgress(0);
-        updateActionButtons();
+        if (!bulk) {
+          state.busy = false;
+          hideDownloadProgress(0);
+          updateActionButtons();
+        }
         if (retryRequested) {
           setTimeout(() => {
             downloadGroup();
@@ -4026,7 +4034,7 @@
         if (media.length === 1) {
           await downloadFile(media[0], { skipDuplicatePrompt: true });
         } else {
-          await downloadGroup({ variants: media }, { skipFinalWait: true });
+          await downloadGroup({ variants: media }, { skipFinalWait: true, bulk: true });
         }
         succeeded += 1;
       } catch (error) {
@@ -4272,7 +4280,7 @@
           if (media.length === 1) {
             await downloadFile(media[0], { skipDuplicatePrompt: true });
           } else {
-            await downloadGroup({ variants: media }, { skipFinalWait: true });
+            await downloadGroup({ variants: media }, { skipFinalWait: true, bulk: true });
           }
           succeeded += 1;
         } catch (error) {
