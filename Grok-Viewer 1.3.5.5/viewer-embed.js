@@ -3276,9 +3276,15 @@
       updateActionButtons();
       return;
     }
+    return deleteAllVideos();
+  };
+
+  // Delete every video under all posts, regardless of the active tab, leaving all
+  // images untouched (only video post ids are collected and deleted).
+  const deleteAllVideos = async () => {
     if (isDeleteAllRunning("videos")) return;
     if (state.busy && !isBusyFromDeleteOnly()) return;
-    if (!window.confirm("Do you want to delete all videos?")) return;
+    if (!window.confirm("Delete all videos under every post? Your images will be kept.")) return;
     beginDeleteAllRun("videos");
     updateActionButtons();
     setStatus("Deleting all videos...");
@@ -7162,12 +7168,12 @@
     if (tabImagesBtn) tabImagesBtn.classList.toggle("active", isImages);
     if (autoNextBtn) autoNextBtn.style.display = isImages ? "none" : "";
     if (downloadAllBtn) downloadAllBtn.textContent = "Download All";
-    if (deleteAllBtn) deleteAllBtn.textContent = "Delete All";
+    if (deleteAllBtn) deleteAllBtn.textContent = "Delete All Videos";
     if (downloadAllBtn) {
       downloadAllBtn.dataset.tooltip = "Download every post into its own folder (videos + image).";
     }
     if (deleteAllBtn) {
-      deleteAllBtn.dataset.tooltip = isImages ? "Delete all your images." : "Delete all your videos.";
+      deleteAllBtn.dataset.tooltip = "Delete all videos under every post (images are kept).";
     }
     if (refreshBtn) {
       refreshBtn.dataset.tooltip = isImages ? "Refresh images." : "Refresh videos.";
@@ -7262,9 +7268,9 @@
       downloadAllBtn.disabled = !hasAny || state.busy;
     }
     if (deleteAllBtn) {
-      const hasItems = isImages ? state.imageItems.length : state.videoItems.length;
-      const currentDeleteRunning = isDeleteAllRunning(state.mode);
-      deleteAllBtn.disabled = !hasItems || currentDeleteRunning || (state.busy && !isBusyFromDeleteOnly());
+      const hasVideos = state.videoItems.length;
+      const currentDeleteRunning = isDeleteAllRunning("videos");
+      deleteAllBtn.disabled = !hasVideos || currentDeleteRunning || (state.busy && !isBusyFromDeleteOnly());
     }
     if (autoNextBtn) autoNextBtn.classList.toggle("active", !isImages && state.autoAdvance);
     if (autoAllBtn) {
@@ -8909,7 +8915,7 @@ const initHideModToastTooltip = () => {};
         requestProgressCancel();
       };
     }
-    if (deleteAllBtn) deleteAllBtn.onclick = deleteAll;
+    if (deleteAllBtn) deleteAllBtn.onclick = deleteAllVideos;
     if (deleteCheckedBtn) deleteCheckedBtn.onclick = deleteCheckedItems;
     if (downloadCheckedBtn) downloadCheckedBtn.onclick = downloadCheckedItems;
     if (checkAllBtn) checkAllBtn.onclick = toggleCheckAllCurrentPage;
