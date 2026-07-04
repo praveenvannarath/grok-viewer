@@ -3929,7 +3929,16 @@
     }
     const run = async () => {
       try {
-        const items = group.variants.slice();
+        // Drop content-duplicate variants (same picture/clip under different postIds)
+        // so one post's folder never gets the same media twice.
+        const seenVariantKeys = new Set();
+        const items = group.variants.slice().filter((variant) => {
+          const key = mediaDedupKey(variant);
+          if (!key) return true;
+          if (seenVariantKeys.has(key)) return false;
+          seenVariantKeys.add(key);
+          return true;
+        });
         const folderName = resolveGroupFolderName(group, options);
         let saved = 0;
         let failed = 0;
@@ -4219,6 +4228,32 @@
     return media;
   };
 
+  // Content identity for a media item: the same picture/clip can appear under two
+  // different postIds (e.g. a child image and its top-level counterpart). Key by the
+  // stable media UUID in the URL so thumbnail/CDN/query variants of the same asset
+  // still collapse; fall back to the stripped URL, then postId. Used to avoid writing
+  // the same file into two folders.
+  const mediaDedupKey = (item) => {
+    if (!item) return "";
+    const primaryUrl = normalizeUrl(item.url || item.mediaUrl || item.playbackUrl || item.hdMediaUrl || "");
+    const imgId =
+      extractImageId(primaryUrl) ||
+      extractImageId(normalizeUrl(item.poster || item.sourceImageUrl || ""));
+    if (imgId) return `img:${imgId}`;
+    const mp4Id = extractMp4Id(primaryUrl);
+    if (mp4Id) return `mp4:${mp4Id}`;
+    const url = stripUrlForKey(primaryUrl);
+    if (url) return `url:${url}`;
+    return item.postId ? `post:${item.postId}` : "";
+  };
+
+  const groupHasVideo = (group) =>
+    Boolean(
+      group &&
+        Array.isArray(group.variants) &&
+        group.variants.some((v) => v && v.kind !== "image")
+    );
+
   const downloadCheckedItems = async () => {
     if (state.busy) return;
     const ids = Array.from(state.selectedPostIds).filter(Boolean);
@@ -4226,29 +4261,33 @@
     let processed = 0;
     let succeeded = 0;
     const skipped = [];
-    // Selected thumbs can belong to the same physical post (its video and image
-    // sides cascade to one media set); download each cluster only once.
-    const processedPostIds = new Set();
-    for (let i = 0; i < ids.length; i += 1) {
-      const postId = ids[i];
-      const cascade = collectCascadingPostIds([postId]);
-      let alreadyDone = false;
-      cascade.forEach((id) => {
-        if (processedPostIds.has(id)) alreadyDone = true;
+    // Selected thumbs can share media (same picture under two posts, or a post's video
+    // and image sides); track written media by content so nothing is saved twice, and
+    // handle video-bearing posts first so shared images attach to the video folder.
+    const orderedIds = ids
+      .map((postId) => ({ postId, media: collectMediaForPostIds([postId]) }))
+      .sort((a, b) => {
+        const av = a.media.some((m) => m && m.kind !== "image") ? 1 : 0;
+        const bv = b.media.some((m) => m && m.kind !== "image") ? 1 : 0;
+        return bv - av;
       });
-      if (alreadyDone) {
+    const writtenKeys = new Set();
+    for (let i = 0; i < orderedIds.length; i += 1) {
+      const { postId, media } = orderedIds[i];
+      const fresh = [];
+      media.forEach((item) => {
+        const key = mediaDedupKey(item);
+        if (!key || writtenKeys.has(key)) return;
+        writtenKeys.add(key);
+        fresh.push(item);
+      });
+      if (!fresh.length) {
         continue;
       }
-      cascade.forEach((id) => processedPostIds.add(id));
-      const media = collectMediaForPostIds([postId]);
-      if (!media.length) {
-        skipped.push(postId);
-        continue;
-      }
-      setStatus(`Downloading post ${i + 1} of ${ids.length}...`);
+      setStatus(`Downloading post ${i + 1} of ${orderedIds.length}...`);
       try {
         await downloadGroup(
-          { variants: media },
+          { variants: fresh },
           { skipFinalWait: true, bulk: true, folderName: postId }
         );
         succeeded += 1;
@@ -4378,38 +4417,40 @@
     setStatus(`Downloading ${groups.length} post${groups.length === 1 ? "" : "s"}...`);
     let succeeded = 0;
     const skipped = [];
-    // One physical post can surface as several groups (e.g. its video side and its
-    // image side get different representative ids). They all cascade to the same
-    // media set, so track processed post ids and download each cluster only once.
-    const processedPostIds = new Set();
+    // A single picture/clip can surface under more than one post (e.g. a child image
+    // and its top-level counterpart), which would otherwise be written into two
+    // folders. Process video-bearing posts first so shared images attach to the video
+    // folder, and track written media by content so nothing is saved twice.
+    const orderedGroups = groups
+      .map((group, index) => ({ group, index }))
+      .sort((a, b) => (groupHasVideo(b.group) ? 1 : 0) - (groupHasVideo(a.group) ? 1 : 0));
+    const writtenKeys = new Set();
     try {
-      for (let i = 0; i < groups.length; i += 1) {
-        const group = groups[i];
+      for (let i = 0; i < orderedGroups.length; i += 1) {
+        const { group, index } = orderedGroups[i];
         const seedIds = group && group.variants && group.variants.length
           ? group.variants.map((v) => v && v.postId).filter(Boolean)
           : (group && group.postId ? [group.postId] : []);
         if (!seedIds.length) {
-          skipped.push(i);
+          skipped.push(index);
           continue;
         }
-        const cascade = collectCascadingPostIds(seedIds);
-        let alreadyDone = false;
-        cascade.forEach((id) => {
-          if (processedPostIds.has(id)) alreadyDone = true;
-        });
-        if (alreadyDone) {
-          continue;
-        }
-        cascade.forEach((id) => processedPostIds.add(id));
         const media = collectMediaForPostIds(seedIds);
-        if (!media.length) {
-          skipped.push(i);
+        const fresh = [];
+        media.forEach((item) => {
+          const key = mediaDedupKey(item);
+          if (!key || writtenKeys.has(key)) return;
+          writtenKeys.add(key);
+          fresh.push(item);
+        });
+        if (!fresh.length) {
+          // Everything here was already written under another post; skip this folder.
           continue;
         }
-        setStatus(`Downloading post ${i + 1} of ${groups.length}...`);
+        setStatus(`Downloading post ${i + 1} of ${orderedGroups.length}...`);
         try {
           await downloadGroup(
-            { variants: media },
+            { variants: fresh },
             {
               skipFinalWait: true,
               bulk: true,
@@ -4418,9 +4459,9 @@
           );
           succeeded += 1;
         } catch (error) {
-          skipped.push(i);
+          skipped.push(index);
         }
-        if (i < groups.length - 1) {
+        if (i < orderedGroups.length - 1) {
           await sleep(150);
         }
       }
