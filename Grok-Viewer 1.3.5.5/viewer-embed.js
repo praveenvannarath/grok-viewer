@@ -346,6 +346,16 @@
     return cleaned.replace(/\/+$/, "");
   };
 
+  const sanitizeFolderSegment = (value) => {
+    if (!value) return "";
+    return String(value)
+      .trim()
+      .replace(/[\\/]+/g, "_")
+      .replace(/\.\./g, "")
+      .replace(/[^a-zA-Z0-9_-]/g, "")
+      .slice(0, 120);
+  };
+
   const getDownloadMode = () => {
     const mode = state.settings && state.settings.downloadMode ? state.settings.downloadMode : "ask_each";
     if (mode === "ask_each" || mode === "folder_once" || mode === "default_auto") return mode;
@@ -379,6 +389,17 @@
       return applyFolderPrefix(filename, getAskEachFolderPath());
     }
     return filename;
+  };
+
+  const resolvePostFolderPrefix = () => {
+    const mode = getDownloadMode();
+    if (mode === "folder_once") {
+      return sanitizeFolderPath(state.settings && state.settings.folderPath ? state.settings.folderPath : "");
+    }
+    if (mode === "ask_each") {
+      return getAskEachFolderPath();
+    }
+    return "";
   };
 
   const resolveSaveAs = () => {
@@ -567,12 +588,24 @@
     if (!ready) return { ok: false, error: "folder-not-ready" };
     if (!chosenFolderHandle) return { ok: false, error: "no-handle" };
     try {
-      const leaf = await getUniqueLeafName(chosenFolderHandle, filename);
-      const fileHandle = await chosenFolderHandle.getFileHandle(leaf, { create: true });
+      const normalized = String(filename || "").replace(/\\/g, "/").replace(/^\/+/, "");
+      const parts = normalized.split("/").filter(Boolean);
+      const leafRaw = parts.pop() || `grok-file-${Date.now()}`;
+      let dir = chosenFolderHandle;
+      const dirSegments = [];
+      for (let i = 0; i < parts.length; i += 1) {
+        const safeSeg = sanitizeFolderSegment(parts[i]);
+        if (!safeSeg) continue;
+        dir = await dir.getDirectoryHandle(safeSeg, { create: true });
+        dirSegments.push(safeSeg);
+      }
+      const leaf = await getUniqueLeafName(dir, leafRaw);
+      const fileHandle = await dir.getFileHandle(leaf, { create: true });
       const writable = await fileHandle.createWritable();
       await writable.write(blob);
       await writable.close();
-      return { ok: true, filename: leaf, local: true };
+      const prefix = dirSegments.join("/");
+      return { ok: true, filename: prefix ? `${prefix}/${leaf}` : leaf, local: true };
     } catch (error) {
       return { ok: false, error: String(error || "write-failed") };
     }
@@ -1202,6 +1235,17 @@
       return item.variants[index] || item.variants[0] || item;
     }
     return item;
+  };
+
+  // Whether the media currently shown in the lightbox is an image. Mirrors the
+  // isImages check in loadPlayer so controls target the right element even for a
+  // mixed video+image group where state.mode (the active tab) may not match.
+  const activeLightboxIsImage = () => {
+    const group = state.items[state.selectedIndex];
+    const item = resolveActiveItem(group) || group;
+    if (!item) return state.mode === "images";
+    const kind = item.kind || (state.mode === "images" ? "image" : "video");
+    return kind === "image" && !!item.url && isImage(item.url, item.mimeType);
   };
 
   const isLandscapeMediaItem = (item) => {
@@ -2174,20 +2218,136 @@
     }
   };
 
+  // Union-find over every loaded post id, linked by the same original/parent/child
+  // relations the download cascade uses, so the grid clusters a post exactly the way
+  // downloads do. Returns a Map of postId -> cluster root id.
+  const buildPostClusterMap = () => {
+    const parent = new Map();
+    const ensure = (id) => {
+      if (!parent.has(id)) parent.set(id, id);
+    };
+    const find = (id) => {
+      let root = id;
+      while (parent.get(root) !== root) root = parent.get(root);
+      let node = id;
+      while (parent.get(node) !== root) {
+        const next = parent.get(node);
+        parent.set(node, root);
+        node = next;
+      }
+      return root;
+    };
+    const union = (a, b) => {
+      ensure(a);
+      ensure(b);
+      const ra = find(a);
+      const rb = find(b);
+      if (ra !== rb) parent.set(rb, ra);
+    };
+    ["videos", "images"].forEach((mode) => {
+      getModeState(mode).pageCache.forEach((pageItems) => {
+        (pageItems || []).forEach((entry) => {
+          if (!entry) return;
+          const pid = normalizeId(entry.postId);
+          if (!pid) return;
+          ensure(pid);
+          [entry.originalPostId, entry.parentPostId].forEach((linkId) => {
+            const l = normalizeId(linkId);
+            if (l) union(pid, l);
+          });
+          (Array.isArray(entry.childVideoIds) ? entry.childVideoIds : []).forEach((cid) => {
+            const c = normalizeId(cid);
+            if (c) union(pid, c);
+          });
+        });
+      });
+    });
+    const map = new Map();
+    parent.forEach((_, id) => map.set(id, find(id)));
+    return map;
+  };
+
+  // Merge a set of per-mode groups that belong to the same physical post into one
+  // unified group whose variants hold both videos and images (videos first).
+  const buildMergedUnifiedGroup = (members) => {
+    const direction = state.sortOrder === "asc" ? 1 : -1;
+    const videos = [];
+    const images = [];
+    members.forEach((group) => {
+      (group && Array.isArray(group.variants) ? group.variants : []).forEach((variant) => {
+        if (!variant) return;
+        if (variant.kind === "image") images.push(variant);
+        else videos.push(variant);
+      });
+    });
+    const byTime = (a, b) => (toTime(a.createdAt) - toTime(b.createdAt)) * direction;
+    const sortedVideos = dedupeItems(videos).slice().sort(byTime);
+    const sortedImages = dedupeImageItems(images).slice().sort(byTime);
+    const sorted = sortedVideos.concat(sortedImages);
+    if (!sorted.length) return members[0];
+    // Prefer a video group's id as the representative (matches folder naming) and
+    // put a video first so the tile shows a video thumbnail when one exists.
+    const videoMember = members.find(
+      (group) => group && Array.isArray(group.variants) && group.variants.some((v) => v && v.kind !== "image")
+    );
+    const repMember = videoMember || members[0];
+    const groupId = normalizeId(repMember && repMember.groupId) || normalizeId(sorted[0].postId);
+    const primary = sorted[0];
+    const latestTime = toTime(primary && primary.createdAt);
+    const merged = {
+      ...primary,
+      groupId,
+      variants: sorted,
+      activeIndex: 0,
+      isGroup: sorted.length > 1,
+      groupCount: sorted.length,
+      groupSortKey: direction === "asc" ? latestTime : -latestTime
+    };
+    sorted.forEach((variant) => rememberGroupAlias(variant && variant.postId, groupId));
+    rememberGroupAlias(merged.postId, groupId);
+    return merged;
+  };
+
+  const mergeUnifiedGroupsAcrossModes = (unifiedGroups) => {
+    const groups = (unifiedGroups || []).filter(
+      (group) => group && Array.isArray(group.variants) && group.variants.length
+    );
+    if (groups.length <= 1) return groups.slice();
+    const clusterMap = buildPostClusterMap();
+    const clusters = new Map();
+    groups.forEach((group, index) => {
+      let key = "";
+      const variants = group.variants || [];
+      for (let i = 0; i < variants.length; i += 1) {
+        const pid = normalizeId(variants[i] && variants[i].postId);
+        if (pid && clusterMap.has(pid)) {
+          key = clusterMap.get(pid);
+          break;
+        }
+      }
+      if (!key) key = normalizeId(group.groupId) || `solo-${index}`;
+      if (!clusters.has(key)) clusters.set(key, []);
+      clusters.get(key).push(group);
+    });
+    const result = [];
+    clusters.forEach((members) => {
+      result.push(members.length === 1 ? members[0] : buildMergedUnifiedGroup(members));
+    });
+    return result;
+  };
+
+  let unifiedItemsMemo = { key: "", result: null };
   const computeAllUnifiedItems = () => {
+    const key = `${groupsMemoStamp.videos}:${groupsMemoStamp.images}:${state.sortOrder}`;
+    if (unifiedItemsMemo.result && unifiedItemsMemo.key === key) {
+      return unifiedItemsMemo.result;
+    }
     const videoGroups = computeAllGroupsForMode("videos");
     const imageGroups = computeAllGroupsForMode("images");
-    const videoGroupIds = new Set();
-    videoGroups.forEach((group) => {
-      const id = group && group.groupId ? String(group.groupId) : "";
-      if (id) videoGroupIds.add(id);
-    });
-    const filteredImageGroups = imageGroups.filter((group) => {
-      if (!group) return false;
-      const id = group.groupId ? String(group.groupId) : "";
-      return !id || !videoGroupIds.has(id);
-    });
-    return sortByCreatedAt([...videoGroups, ...filteredImageGroups]);
+    const merged = mergeUnifiedGroupsAcrossModes([...videoGroups, ...imageGroups]);
+    const result = sortByCreatedAt(merged);
+    unifiedItemsMemo = { key, result };
+    return result;
   };
 
   const computeCurrentItems = () => {
@@ -3682,20 +3842,73 @@
     downloadFile(item);
   };
 
+  const resolveGroupFolderName = (group, options) => {
+    const explicit = options && options.folderName ? sanitizeFolderSegment(options.folderName) : "";
+    if (explicit) return explicit;
+    const raw =
+      (group && (group.groupId || group.postId)) ||
+      (group &&
+        group.variants &&
+        group.variants[0] &&
+        (group.variants[0].postId || group.variants[0].id)) ||
+      "";
+    return sanitizeFolderSegment(raw) || "grok-post";
+  };
+
+  // Check whether <postFolder>/<name> is already on disk. Only reliable in folder
+  // mode (we have a directory handle to query); other modes can't inspect the disk,
+  // so this returns false and the download proceeds as usual.
+  const postFileExists = async (postFolder, name) => {
+    if (getDownloadMode() !== "folder_once" || !chosenFolderHandle) return false;
+    try {
+      const safePost = sanitizeFolderSegment(postFolder);
+      let dir = chosenFolderHandle;
+      if (safePost) {
+        dir = await chosenFolderHandle.getDirectoryHandle(safePost, { create: false });
+      }
+      await dir.getFileHandle(name, { create: false });
+      return true;
+    } catch (error) {
+      return false;
+    }
+  };
+
+  // Save a single compilation file into a per-post subfolder (folder name = post ID).
+  // Prefers the chosen File System Access handle (silent, real nested folders);
+  // otherwise falls back to the browser downloader with a subfolder path.
+  const downloadGroupFile = async (blob, name, postFolder) => {
+    const safePost = sanitizeFolderSegment(postFolder);
+    if (getDownloadMode() === "folder_once" && chosenFolderHandle) {
+      const rel = safePost ? `${safePost}/${name}` : name;
+      const local = await writeBlobToChosenFolder(blob, rel);
+      if (local && local.ok) return local;
+    }
+    const prefix = resolvePostFolderPrefix();
+    const fullRel = [prefix, safePost, name].filter(Boolean).join("/");
+    const blobUrl = URL.createObjectURL(blob);
+    const result = await downloadViaExtension(blobUrl, fullRel, resolveSaveAs());
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
+    if (result && result.ok) return { ...result, filename: fullRel };
+    // Last resort: direct anchor download (browsers flatten the subfolder here).
+    return downloadBlobDirect(blob, name);
+  };
+
   const downloadGroup = async (groupArg, options) => {
     const group = groupArg || state.items[state.selectedIndex];
     const skipFinalWait = !!(options && options.skipFinalWait);
     const bulk = !!(options && options.bulk);
-    if (!group || !group.variants || group.variants.length <= 1) return;
+    // When foldering (a folderName is supplied) a single-media post is valid and
+    // still gets its own folder; otherwise require an actual compilation (2+).
+    const minVariants = options && options.folderName ? 1 : 2;
+    if (!group || !group.variants || group.variants.length < minVariants) return;
     if (!bulk && state.busy) return;
     const ready = await ensureFolderModeReady();
     if (!ready) return;
-    const isImages = state.mode === "images";
     if (!bulk) {
       state.busy = true;
       updateActionButtons();
     }
-    setStatus("Preparing compilation...");
+    setStatus(group.variants.length > 1 ? "Preparing compilation..." : "Preparing download...");
     showDownloadProgress();
     if (downloadGroupBtn) {
       downloadGroupBtn.classList.add("done");
@@ -3705,13 +3918,28 @@
       }, 5000);
     }
     const run = async () => {
-      let retryRequested = false;
       try {
         const items = group.variants.slice();
-        const files = [];
+        const folderName = resolveGroupFolderName(group, options);
+        let saved = 0;
+        let failed = 0;
+        let skippedExisting = 0;
+        const doneItems = [];
+        let lastFilename = "";
+        let lastLocal = false;
         for (let i = 0; i < items.length; i += 1) {
           const item = items[i];
           if (!item) continue;
+          const name = resolveMediaDownloadFilename(item);
+          // Skip files that are already on disk (folder mode only) — no re-fetch.
+          if (await postFileExists(folderName, name)) {
+            skippedExisting += 1;
+            doneItems.push(item);
+            const skipText = `Skipping existing ${folderName}/ ${i + 1}/${items.length}...`;
+            setStatus(skipText);
+            setDownloadProgress(skipText, (i + 1) / items.length);
+            continue;
+          }
           let response = null;
           let candidates = buildDownloadCandidates(item);
           for (let c = 0; c < candidates.length; c += 1) {
@@ -3734,80 +3962,52 @@
               }
             }
           }
-          if (!response || !response.ok) continue;
-          const buffer = new Uint8Array(await response.arrayBuffer());
-          const { dosTime, dosDate } = toDosTimeDate(new Date());
-          const itemIsImage =
-            (item && item.kind === "image") ||
-            (item && isImage(item.url, item.mimeType));
-          const fetchedUrl = (response && response.url) || (item && item.url) || "";
-          const baseUrl = String(fetchedUrl).split(/[?#]/)[0];
-          const extMatch = baseUrl.match(/\.([a-z0-9]{2,6})$/i);
-          const urlExt = extMatch ? extMatch[1].toLowerCase() : "";
-          const videoExts = new Set(["mp4", "m4v", "mov", "webm"]);
-          const imageExts = new Set(["jpg", "jpeg", "png", "webp", "gif", "avif"]);
-          let ext;
-          if (itemIsImage) {
-            ext = imageExts.has(urlExt) ? urlExt : "jpg";
-          } else if (urlExt && videoExts.has(urlExt)) {
-            ext = urlExt;
-          } else {
-            ext = isImages ? "jpg" : "mp4";
+          if (!response || !response.ok) {
+            failed += 1;
+            continue;
           }
-          const name = `${item.postId || item.id}.${ext}`;
-          files.push({
-            name,
-            data: buffer,
-            size: buffer.length,
-            crc: crc32(buffer),
-            dosTime,
-            dosDate
-          });
-          const prepText = `Preparing compilation ${i + 1}/${items.length}...`;
+          const blob = await response.blob();
+          const result = await downloadGroupFile(blob, name, folderName);
+          if (result && result.ok) {
+            saved += 1;
+            doneItems.push(item);
+            lastFilename = result.filename || name;
+            lastLocal = !!result.local;
+          } else {
+            failed += 1;
+          }
+          const prepText = `Saving ${folderName}/ ${i + 1}/${items.length}...`;
           setStatus(prepText);
           setDownloadProgress(prepText, (i + 1) / items.length);
           await sleep(80);
         }
-        if (!files.length) {
+        if (!saved && !skippedExisting) {
           setStatus("Download failed.");
           return;
         }
-        const blob = buildZipBlob(files);
-        const archiveName = `grok-compilation-${Date.now()}.zip`;
-        const savePrompt = resolveSaveAs();
-        let started = await downloadBlobViaExtension(blob, archiveName);
-        let archiveVerify = await verifyDownloadResult(started, savePrompt ? 120000 : 15000, !!savePrompt);
-        if (!archiveVerify.ok) {
-          const directStarted = await downloadBlobDirect(blob, archiveName);
-          if (directStarted && directStarted.ok) {
-            started = directStarted;
-            archiveVerify = { ok: true, state: "direct", outcome: null };
-          }
-        }
-        if (!archiveVerify.ok) {
-          retryRequested = await askArchiveRetry("Archive download interrupted. Do you want to retry?");
-          if (!retryRequested) {
-            setStatus("Download stopped.");
-            if (archiveVerify.state === "canceled" || isDownloadCanceled(started)) maybePromptDownloadSetupGuide();
-          }
-          return;
-        }
-        if (savePrompt && archiveVerify.outcome) {
-          rememberAskEachFolderFromDownloadOutcome(archiveVerify.outcome, started.filename || archiveName);
-        }
-        recordDownloadedItems(state.mode, items);
+        recordDownloadedItems(state.mode, doneItems);
         syncVisibleDownloadedBadges();
-        const startText = "Starting download of archive 1...";
-        setStatus(startText);
-        setDownloadProgress(startText, 0);
-        const effectiveName = started.filename || archiveName;
-        showDownloadReady("Your file is ready. Click here", effectiveName);
+        let doneText;
+        if (saved && skippedExisting) {
+          doneText = `Saved ${saved}, skipped ${skippedExisting} existing → ${folderName}/`;
+        } else if (skippedExisting && !saved) {
+          doneText = `Already in ${folderName}/ (${skippedExisting} file${skippedExisting === 1 ? "" : "s"})`;
+        } else if (failed > 0) {
+          doneText = `Saved ${saved}/${saved + failed} to ${folderName}/`;
+        } else {
+          doneText = `Saved ${saved} file${saved === 1 ? "" : "s"} to ${folderName}/`;
+        }
+        setStatus(doneText);
+        setDownloadProgress(doneText, 1);
+        if (saved > 0) {
+          showDownloadReady("Your files are ready. Click here", lastFilename || folderName);
+        }
         if (!bulk) {
           state.busy = false;
           updateActionButtons();
         }
-        if (!skipFinalWait) {
-          await waitForDownloadWithTimeout(effectiveName, true, 20000);
+        if (!skipFinalWait && lastFilename && !lastLocal) {
+          await waitForDownloadWithTimeout(lastFilename, true, 20000);
         }
       } catch (error) {
         setStatus("Download failed.");
@@ -3816,11 +4016,6 @@
           state.busy = false;
           hideDownloadProgress(0);
           updateActionButtons();
-        }
-        if (retryRequested) {
-          setTimeout(() => {
-            downloadGroup();
-          }, 120);
         }
       }
     };
@@ -3879,11 +4074,10 @@
       showToast("No media found under this post.", "info");
       return;
     }
-    if (media.length === 1) {
-      downloadFile(media[0]);
-      return;
-    }
-    await downloadGroup({ variants: media });
+    await downloadGroup(
+      { variants: media },
+      { folderName: (item && (item.groupId || item.postId || item.id)) || "" }
+    );
   };
 
   const deleteAllVideosForItem = async (item) => {
@@ -4022,8 +4216,20 @@
     let processed = 0;
     let succeeded = 0;
     const skipped = [];
+    // Selected thumbs can belong to the same physical post (its video and image
+    // sides cascade to one media set); download each cluster only once.
+    const processedPostIds = new Set();
     for (let i = 0; i < ids.length; i += 1) {
       const postId = ids[i];
+      const cascade = collectCascadingPostIds([postId]);
+      let alreadyDone = false;
+      cascade.forEach((id) => {
+        if (processedPostIds.has(id)) alreadyDone = true;
+      });
+      if (alreadyDone) {
+        continue;
+      }
+      cascade.forEach((id) => processedPostIds.add(id));
       const media = collectMediaForPostIds([postId]);
       if (!media.length) {
         skipped.push(postId);
@@ -4031,11 +4237,10 @@
       }
       setStatus(`Downloading post ${i + 1} of ${ids.length}...`);
       try {
-        if (media.length === 1) {
-          await downloadFile(media[0], { skipDuplicatePrompt: true });
-        } else {
-          await downloadGroup({ variants: media }, { skipFinalWait: true, bulk: true });
-        }
+        await downloadGroup(
+          { variants: media },
+          { skipFinalWait: true, bulk: true, folderName: postId }
+        );
         succeeded += 1;
       } catch (error) {
         skipped.push(postId);
@@ -4123,103 +4328,6 @@
     updateDeleteCheckedButton();
   };
 
-  const crcTable = (() => {
-    const table = new Uint32Array(256);
-    for (let i = 0; i < 256; i += 1) {
-      let c = i;
-      for (let k = 0; k < 8; k += 1) {
-        c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      }
-      table[i] = c >>> 0;
-    }
-    return table;
-  })();
-
-  const crc32 = (data) => {
-    let crc = 0xffffffff;
-    for (let i = 0; i < data.length; i += 1) {
-      const byte = data[i];
-      crc = crcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
-    }
-    return (crc ^ 0xffffffff) >>> 0;
-  };
-
-  const toDosTimeDate = (date) => {
-    const year = Math.max(1980, date.getFullYear());
-    const month = date.getMonth() + 1;
-    const day = date.getDate();
-    const hours = date.getHours();
-    const minutes = date.getMinutes();
-    const seconds = Math.floor(date.getSeconds() / 2);
-    const dosTime = (hours << 11) | (minutes << 5) | seconds;
-    const dosDate = ((year - 1980) << 9) | (month << 5) | day;
-    return { dosTime, dosDate };
-  };
-
-  const buildZipBlob = (files) => {
-    const encoder = new TextEncoder();
-    const localParts = [];
-    const centralParts = [];
-    let offset = 0;
-
-    files.forEach((file) => {
-      const nameBytes = encoder.encode(file.name);
-      const header = new Uint8Array(30 + nameBytes.length);
-      const headerView = new DataView(header.buffer);
-      headerView.setUint32(0, 0x04034b50, true);
-      headerView.setUint16(4, 20, true);
-      headerView.setUint16(6, 0, true);
-      headerView.setUint16(8, 0, true);
-      headerView.setUint16(10, file.dosTime, true);
-      headerView.setUint16(12, file.dosDate, true);
-      headerView.setUint32(14, file.crc, true);
-      headerView.setUint32(18, file.size, true);
-      headerView.setUint32(22, file.size, true);
-      headerView.setUint16(26, nameBytes.length, true);
-      headerView.setUint16(28, 0, true);
-      header.set(nameBytes, 30);
-      localParts.push(header, file.data);
-
-      const central = new Uint8Array(46 + nameBytes.length);
-      const centralView = new DataView(central.buffer);
-      centralView.setUint32(0, 0x02014b50, true);
-      centralView.setUint16(4, 20, true);
-      centralView.setUint16(6, 20, true);
-      centralView.setUint16(8, 0, true);
-      centralView.setUint16(10, 0, true);
-      centralView.setUint16(12, file.dosTime, true);
-      centralView.setUint16(14, file.dosDate, true);
-      centralView.setUint32(16, file.crc, true);
-      centralView.setUint32(20, file.size, true);
-      centralView.setUint32(24, file.size, true);
-      centralView.setUint16(28, nameBytes.length, true);
-      centralView.setUint16(30, 0, true);
-      centralView.setUint16(32, 0, true);
-      centralView.setUint16(34, 0, true);
-      centralView.setUint16(36, 0, true);
-      centralView.setUint32(38, 0, true);
-      centralView.setUint32(42, offset, true);
-      central.set(nameBytes, 46);
-      centralParts.push(central);
-
-      offset += header.length + file.size;
-    });
-
-    const centralSize = centralParts.reduce((sum, part) => sum + part.length, 0);
-    const end = new Uint8Array(22);
-    const endView = new DataView(end.buffer);
-    endView.setUint32(0, 0x06054b50, true);
-    endView.setUint16(4, 0, true);
-    endView.setUint16(6, 0, true);
-    endView.setUint16(8, files.length, true);
-    endView.setUint16(10, files.length, true);
-    endView.setUint32(12, centralSize, true);
-    endView.setUint32(16, offset, true);
-    endView.setUint16(20, 0, true);
-
-    return new Blob([...localParts, ...centralParts, end], { type: "application/zip" });
-  };
-
   const downloadAll = async () => {
     if (state.busy) return;
     const ready = await ensureFolderModeReady();
@@ -4260,6 +4368,10 @@
     setStatus(`Downloading ${groups.length} post${groups.length === 1 ? "" : "s"}...`);
     let succeeded = 0;
     const skipped = [];
+    // One physical post can surface as several groups (e.g. its video side and its
+    // image side get different representative ids). They all cascade to the same
+    // media set, so track processed post ids and download each cluster only once.
+    const processedPostIds = new Set();
     try {
       for (let i = 0; i < groups.length; i += 1) {
         const group = groups[i];
@@ -4270,6 +4382,15 @@
           skipped.push(i);
           continue;
         }
+        const cascade = collectCascadingPostIds(seedIds);
+        let alreadyDone = false;
+        cascade.forEach((id) => {
+          if (processedPostIds.has(id)) alreadyDone = true;
+        });
+        if (alreadyDone) {
+          continue;
+        }
+        cascade.forEach((id) => processedPostIds.add(id));
         const media = collectMediaForPostIds(seedIds);
         if (!media.length) {
           skipped.push(i);
@@ -4277,11 +4398,14 @@
         }
         setStatus(`Downloading post ${i + 1} of ${groups.length}...`);
         try {
-          if (media.length === 1) {
-            await downloadFile(media[0], { skipDuplicatePrompt: true });
-          } else {
-            await downloadGroup({ variants: media }, { skipFinalWait: true, bulk: true });
-          }
+          await downloadGroup(
+            { variants: media },
+            {
+              skipFinalWait: true,
+              bulk: true,
+              folderName: (group && (group.groupId || group.postId)) || seedIds[0] || ""
+            }
+          );
           succeeded += 1;
         } catch (error) {
           skipped.push(i);
@@ -4752,16 +4876,6 @@
 
   const isProgressCancelRequested = (action) =>
     Boolean(progressControl.requested && progressControl.action && (!action || progressControl.action === action));
-
-  const askArchiveRetry = async (message) => {
-    hideDuplicateModal();
-    const retry = await askDuplicateModal(
-      message || "Archive download was interrupted. Do you want to retry?",
-      15
-    );
-    hideDuplicateModal();
-    return retry;
-  };
 
   let downloadProgressTimer = null;
   const showDownloadProgress = () => {
@@ -6999,7 +7113,7 @@
     if (downloadAllBtn) downloadAllBtn.textContent = "Download All";
     if (deleteAllBtn) deleteAllBtn.textContent = "Delete All";
     if (downloadAllBtn) {
-      downloadAllBtn.dataset.tooltip = "Download every post as its own zip (videos + image).";
+      downloadAllBtn.dataset.tooltip = "Download every post into its own folder (videos + image).";
     }
     if (deleteAllBtn) {
       deleteAllBtn.dataset.tooltip = isImages ? "Delete all your images." : "Delete all your videos.";
@@ -8290,6 +8404,7 @@
     if (!isGridMode()) return;
     const group = state.items[state.selectedIndex];
     if (!group || !group.variants || group.variants.length <= 1) return;
+    clearAutoAdvanceAllTimer();
     const total = group.variants.length;
     const current = Number.isFinite(group.activeIndex) ? group.activeIndex : 0;
     const next = (current + delta + total) % total;
@@ -8298,24 +8413,49 @@
     renderVariantStrip();
   };
 
+  let autoAdvanceAllTimer = null;
+  const clearAutoAdvanceAllTimer = () => {
+    if (autoAdvanceAllTimer) {
+      clearTimeout(autoAdvanceAllTimer);
+      autoAdvanceAllTimer = null;
+    }
+  };
+  // Videos advance on their "ended" event; images have no such event, so when
+  // autoplay-all lands on an image variant, advance after a short slideshow delay.
+  const scheduleAutoAdvanceAllForImage = () => {
+    clearAutoAdvanceAllTimer();
+    if (!state.autoAdvanceAll || !isGridMode()) return;
+    if (!activeLightboxIsImage()) return;
+    autoAdvanceAllTimer = setTimeout(() => {
+      autoAdvanceAllTimer = null;
+      if (state.autoAdvanceAll && lightboxEl && lightboxEl.classList.contains("open")) {
+        stepAutoplayAll();
+      }
+    }, 3000);
+  };
+
   const stepAutoplayAll = () => {
     if (!isGridMode() || !state.items.length) return;
     const group = state.items[state.selectedIndex];
+    let advancedWithinGroup = false;
     if (group && group.variants && group.variants.length > 1) {
       const current = Number.isFinite(group.activeIndex) ? group.activeIndex : 0;
       if (current < group.variants.length - 1) {
         group.activeIndex = current + 1;
         loadPlayer();
         renderVariantStrip();
-        return;
+        advancedWithinGroup = true;
       }
     }
-    state.selectedIndex = (state.selectedIndex + 1 + state.items.length) % state.items.length;
-    const nextGroup = state.items[state.selectedIndex];
-    if (nextGroup && nextGroup.variants && nextGroup.variants.length > 0) {
-      nextGroup.activeIndex = 0;
+    if (!advancedWithinGroup) {
+      state.selectedIndex = (state.selectedIndex + 1 + state.items.length) % state.items.length;
+      const nextGroup = state.items[state.selectedIndex];
+      if (nextGroup && nextGroup.variants && nextGroup.variants.length > 0) {
+        nextGroup.activeIndex = 0;
+      }
+      loadPlayer();
     }
-    loadPlayer();
+    scheduleAutoAdvanceAllForImage();
   };
 
   const toggleAutoAdvanceAll = () => {
@@ -8323,6 +8463,8 @@
     state.autoAdvanceAll = !state.autoAdvanceAll;
     if (state.autoAdvanceAll) state.autoAdvance = false;
     if (playerEl) playerEl.loop = false;
+    if (!state.autoAdvanceAll) clearAutoAdvanceAllTimer();
+    else scheduleAutoAdvanceAllForImage();
     updateActionButtons();
   };
 
@@ -8447,6 +8589,7 @@
 
   const closeLightbox = () => {
     if (!lightboxEl) return;
+    clearAutoAdvanceAllTimer();
     clearLightboxPromptInlineNotice();
     lightboxEl.classList.remove("open");
     lightboxEl.classList.remove("gv-landscape-video");
@@ -8476,6 +8619,7 @@
 
   const step = (delta) => {
     if (!state.items.length) return;
+    clearAutoAdvanceAllTimer();
     state.selectedIndex = (state.selectedIndex + delta + state.items.length) % state.items.length;
     loadPlayer();
   };
@@ -8644,7 +8788,7 @@ const initHideModToastTooltip = () => {};
       img.alt = "Generated image";
       img.style.cssText = "display:none;border-radius:18px;";
       img.addEventListener("dblclick", () => {
-        if (state.mode !== "images" || !imageEl) return;
+        if (!activeLightboxIsImage() || !imageEl) return;
         if (document.fullscreenElement) return;
         if (imageEl.requestFullscreen) {
           imageEl.requestFullscreen().catch(() => {});
@@ -9167,7 +9311,7 @@ const initHideModToastTooltip = () => {};
     if (fullscreenBtn) {
       fullscreenBtn.onclick = () => {
         spinButtonIcon(fullscreenBtn);
-        const targetEl = state.mode === "images" ? imageEl : playerEl;
+        const targetEl = activeLightboxIsImage() ? imageEl : playerEl;
         if (!targetEl) return;
         const isFullscreen = document.fullscreenElement;
         if (isFullscreen) {
@@ -9183,7 +9327,7 @@ const initHideModToastTooltip = () => {};
     if (nextBtn) nextBtn.onclick = () => step(1);
     if (playerEl) {
       playerEl.addEventListener("ended", () => {
-        if (state.mode === "images") return;
+        if (activeLightboxIsImage()) return;
         if (isGridMode() && state.autoAdvanceAll) {
           stepAutoplayAll();
           return;
@@ -9234,7 +9378,7 @@ const initHideModToastTooltip = () => {};
       if (event.key === "Escape") closeLightbox();
       if (event.key === " " || event.code === "Space") {
         event.preventDefault();
-        if (state.mode === "images") return;
+        if (activeLightboxIsImage()) return;
         if (!playerEl) return;
         if (playerEl.paused) {
           const playPromise = playerEl.play();
