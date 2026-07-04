@@ -1058,7 +1058,7 @@
     };
   };
 
-  const buildImageItem = (post) => {
+  const buildImageItem = (post, parentPostId) => {
     if (!post) return null;
     const rawUrl = post.mediaUrl || "";
     if (!isImage(rawUrl, post.mimeType)) return null;
@@ -1101,7 +1101,7 @@
       poster: optimizeThumbUrl(url),
       postId: post.id || "",
       originalPostId: post.originalPostId || "",
-      parentPostId: post.parentPostId || post.originalPostId || "",
+      parentPostId: post.parentPostId || post.originalPostId || parentPostId || "",
       createdAt: getCreatedAtValue(post),
       promptText: promptCandidate,
       childVideoIds,
@@ -1124,10 +1124,16 @@
       (post.videos || []).forEach((video) => {
         const videoItem = buildItem(video, post.id || "", parentImageUrl, parentPrompt);
         if (videoItem) videos.push(videoItem);
+        const childImage = buildImageItem(video, post.id || "");
+        if (childImage) images.push(childImage);
       });
       (post.childPosts || []).forEach((child) => {
         const childItem = buildItem(child, post.id || "", parentImageUrl, parentPrompt);
         if (childItem) videos.push(childItem);
+        // Child posts can be images too; buildItem only handles videos, so a child
+        // image would be dropped otherwise (only the top-level image is captured).
+        const childImage = buildImageItem(child, post.id || "");
+        if (childImage) images.push(childImage);
       });
       if (post && post.originalPost) {
         const original = post.originalPost;
@@ -1136,15 +1142,19 @@
           original && (original.originalPrompt || original.prompt)
             ? original.originalPrompt || original.prompt
             : parentPrompt;
-        const originalImageItem = buildImageItem(original);
+        const originalImageItem = buildImageItem(original, post.id || "");
         if (originalImageItem) images.push(originalImageItem);
         (original.videos || []).forEach((video) => {
           const videoItem = buildItem(video, original.id || "", originalImageUrl, originalPrompt);
           if (videoItem) videos.push(videoItem);
+          const childImage = buildImageItem(video, original.id || "");
+          if (childImage) images.push(childImage);
         });
         (original.childPosts || []).forEach((child) => {
           const childItem = buildItem(child, original.id || "", originalImageUrl, originalPrompt);
           if (childItem) videos.push(childItem);
+          const childImage = buildImageItem(child, original.id || "");
+          if (childImage) images.push(childImage);
         });
       }
     });
