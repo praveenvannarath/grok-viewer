@@ -2979,16 +2979,26 @@
     return code >= 500;
   };
 
-  const collectCascadingPostIds = (rootPostIds) => {
-    const allEntries = [];
-    ["videos", "images"].forEach((mode) => {
-      const modeState = getModeState(mode);
-      modeState.pageCache.forEach((pageItems) => {
+  // Every loaded item, across the legacy per-mode caches AND the v2 conversation cache.
+  // Collectors that walked only the mode caches silently missed all conversation media.
+  const forEachLoadedEntry = (visit) => {
+    const caches = [
+      state.v2.pageCache,
+      getModeState("videos").pageCache,
+      getModeState("images").pageCache
+    ];
+    caches.forEach((cache) => {
+      cache.forEach((pageItems) => {
         (pageItems || []).forEach((entry) => {
-          if (entry) allEntries.push(entry);
+          if (entry) visit(entry);
         });
       });
     });
+  };
+
+  const collectCascadingPostIds = (rootPostIds) => {
+    const allEntries = [];
+    forEachLoadedEntry((entry) => allEntries.push(entry));
     const byId = new Map();
     allEntries.forEach((entry) => {
       const pid = normalizeId(entry.postId);
@@ -4349,24 +4359,33 @@
       : [item.postId].filter(Boolean);
     if (!seedIds.length) return [];
     const allIds = collectCascadingPostIds(seedIds);
+    // Conversation media has no cascade links between assets -- everything is tied to
+    // the conversation instead -- so also take anything sharing this group's root.
+    const rootIds = new Set();
+    const addRoot = (value) => {
+      const norm = normalizeId(value);
+      if (norm) rootIds.add(norm);
+    };
+    addRoot(item.groupId);
+    addRoot(item.rootPostId);
+    (item.variants || []).forEach((variant) => addRoot(variant && variant.rootPostId));
     const seen = new Set();
     const media = [];
-    ["videos", "images"].forEach((mode) => {
-      const ms = getModeState(mode);
-      ms.pageCache.forEach((pageItems) => {
-        (pageItems || []).forEach((entry) => {
-          if (!entry || !entry.postId) return;
-          const pid = String(entry.postId);
-          if (!allIds.has(pid) || seen.has(pid)) return;
-          seen.add(pid);
-          media.push(entry);
-        });
-      });
+    forEachLoadedEntry((entry) => {
+      if (!entry || !entry.postId) return;
+      const pid = String(entry.postId);
+      if (seen.has(pid)) return;
+      if (!allIds.has(pid) && !rootIds.has(normalizeId(entry.rootPostId))) return;
+      seen.add(pid);
+      media.push(entry);
     });
     return media;
   };
 
   const downloadAllVideosForItem = async (item) => {
+    // Conversation tiles hold only their latest asset until hydrated; pull the rest in
+    // first or this reports far less media than the post actually has.
+    await hydrateConversationVariants(normalizeId(item && item.groupId));
     const media = collectMediaUnderPost(item);
     if (!media.length) {
       showToast("No media found under this post.", "info");
@@ -4492,17 +4511,12 @@
     const allIds = collectCascadingPostIds(postIds);
     const seen = new Set();
     const media = [];
-    ["videos", "images"].forEach((mode) => {
-      const ms = getModeState(mode);
-      ms.pageCache.forEach((pageItems) => {
-        (pageItems || []).forEach((entry) => {
-          if (!entry || !entry.postId) return;
-          const pid = String(entry.postId);
-          if (!allIds.has(pid) || seen.has(pid)) return;
-          seen.add(pid);
-          media.push(entry);
-        });
-      });
+    forEachLoadedEntry((entry) => {
+      if (!entry || !entry.postId) return;
+      const pid = String(entry.postId);
+      if (!allIds.has(pid) || seen.has(pid)) return;
+      seen.add(pid);
+      media.push(entry);
     });
     return media;
   };
