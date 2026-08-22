@@ -4692,18 +4692,39 @@
           safety += 1;
         }
       };
-      let v2Safety = 0;
-      while (!state.v2.exhausted && v2Safety < 2000) {
-        await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
-        v2Safety += 1;
-      }
+      // Walking every conversation can be hundreds of requests. Throttle them and retry
+      // transient failures, so one blip (or a rate limit) does not abort the whole run.
+      const exhaustConversations = async () => {
+        let safety = 0;
+        while (!state.v2.exhausted && safety < 2000) {
+          const pageIndex = state.v2.pageTokens.length - 1;
+          let lastError = null;
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            try {
+              await fetchAndCacheV2Page(pageIndex);
+              lastError = null;
+              break;
+            } catch (error) {
+              lastError = error;
+              await sleep(500 * (attempt + 1));
+            }
+          }
+          if (lastError) throw lastError;
+          safety += 1;
+          setStatus(`Loading conversations... ${state.v2.totalLoaded} items`);
+          await sleep(120);
+        }
+      };
+      await exhaustConversations();
+      setStatus("Loading saved posts...");
       await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
     } catch (error) {
+      const detail = String((error && error.message) || error || "unknown error");
       state.busy = false;
       hideDownloadProgress(0);
       updateActionButtons();
-      setStatus("Failed to load all pages.");
-      showToast("Failed to load all pages.", "error");
+      setStatus(`Failed to load all pages: ${detail}`);
+      showToast(`Failed to load all pages: ${detail}`, "error");
       return;
     }
     invalidateGroupsMemo();
