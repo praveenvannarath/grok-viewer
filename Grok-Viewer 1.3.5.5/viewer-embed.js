@@ -5022,7 +5022,14 @@
     } catch (error) {
       totalPosts = state.items.length;
     }
-    const videoTotal = getModeState("videos").totalLoaded || 0;
+    let videoTotal = getModeState("videos").totalLoaded || 0;
+    // Same blind spot in the toolbar counter: without this it reads "0 videos" while
+    // the grid shows nothing but conversation videos.
+    state.v2.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        if (entry && entry.kind !== "image") videoTotal += 1;
+      });
+    });
     return { totalPosts, videoTotal };
   };
 
@@ -7560,7 +7567,14 @@
       updateRegenButtonVisual();
     }
     if (downloadAllBtn) {
-      const hasAny = state.videoItems.length || state.imageItems.length;
+      // Conversation media never lands in the per-mode caches, and in grid mode the v2
+      // stream is walked before the legacy one -- so gating on videoItems/imageItems
+      // alone left this disabled while the grid was full of conversation tiles.
+      const hasAny =
+        state.videoItems.length ||
+        state.imageItems.length ||
+        state.v2.totalLoaded ||
+        state.items.length;
       downloadAllBtn.disabled = !hasAny || state.busy;
     }
     if (deleteAllBtn) {
