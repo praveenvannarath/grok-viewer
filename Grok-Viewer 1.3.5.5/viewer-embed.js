@@ -10,6 +10,16 @@
   const POST_GET_URL = "/rest/media/post/get";
   const REGEN_CONVERSATION_URL = "/rest/app-chat/conversations/new";
   const LIMIT = 40;
+  // Grok migrated Imagine to a conversation model. New generations never enter
+  // /rest/media/post/list (they carry no userInteractionStatus), so the viewer reads
+  // them from the same endpoint grok.com/imagine/saved uses. One conversation = one
+  // tile; its assets are the variants. Legacy liked posts still come from the old list
+  // and are ordered after every conversation, which is chronologically correct because
+  // v2 covers everything created after the rollout.
+  const CONV_LIST_URL = "/rest/app-chat/conversations";
+  const CONV_KIND = "CONVERSATION_KIND_IMAGINE";
+  const CONV_PAGE_SIZE = 40;
+  const LEGACY_ORDER_BASE = 1e9;
   const GRID_TILES_PER_PAGE = 40;
   const SOURCE = "MEDIA_POST_SOURCE_LIKED";
   const REGEN_COOLDOWN_MS = 15000;
@@ -150,6 +160,14 @@
     groupOrder: new Map(),
     groupLatest: new Map(),
     deleteAllRunning: { videos: false, images: false },
+    v2: {
+      exhausted: false,
+      pageCache: new Map(),
+      pageTokens: [null],
+      seen: new Set(),
+      totalLoaded: 0,
+      hydrated: new Set()
+    },
     modeState: {
       videos: createModeState(),
       images: createModeState()
@@ -656,6 +674,35 @@
     return response.json();
   };
 
+  const fetchConversationsPage = async (pageToken) => {
+    const params = new URLSearchParams({ pageSize: String(CONV_PAGE_SIZE), kind: CONV_KIND });
+    if (pageToken) params.set("pageToken", pageToken);
+    let response;
+    try {
+      response = await fetch(`${CONV_LIST_URL}?${params.toString()}`, {
+        method: "GET",
+        credentials: "include"
+      });
+    } catch (networkError) {
+      autoRefreshLastFetchStatus = -1;
+      throw networkError;
+    }
+    if (!response.ok) {
+      autoRefreshLastFetchStatus = response.status;
+      throw new Error(`HTTP ${response.status}`);
+    }
+    return response.json();
+  };
+
+  const fetchConversationResponses = async (conversationId) => {
+    if (!conversationId) return [];
+    const url = `${CONV_LIST_URL}/${encodeURIComponent(conversationId)}/responses?conversationKind=${CONV_KIND}`;
+    const response = await fetch(url, { method: "GET", credentials: "include" });
+    if (!response.ok) throw new Error(`responses HTTP ${response.status}`);
+    const data = await response.json();
+    return data && Array.isArray(data.responses) ? data.responses : [];
+  };
+
   const isUnavailableUrlValue = (value) => {
     const text = String(value || "").trim().toLowerCase();
     if (!text) return true;
@@ -1111,10 +1158,107 @@
     };
   };
 
-  const extractItems = (posts) => {
+  // Turn a v2 asset descriptor (conversation latestAssetMetadata, or a response's
+  // fileAttachmentAssetMetadata entry) into the same item shape the rest of the viewer
+  // consumes. `key` is a bare "users/..." path that normalizeUrl already resolves.
+  const buildItemFromAsset = (asset, conversationId, order) => {
+    if (!asset || asset.isDeleted) return null;
+    const key = String(asset.key || "");
+    const url = normalizeUrl(key);
+    if (!url) return null;
+    const mimeType = String(asset.mimeType || "");
+    const isVideo = isMp4(url, mimeType) || mimeType.startsWith("video/");
+    if (!isVideo && !isImage(url, mimeType)) return null;
+    const assetId = normalizeId(asset.assetId) || url;
+    const aux = (asset && asset.auxKeys) || {};
+    const previewKey = aux["preview-image"] || aux["original-image"] || "";
+    const gen = (asset && asset.mediaGenInput) || {};
+    const genLeaf = gen.imageToVideo || gen.textToVideo || gen.textToImage || gen.imageToImage || {};
+    const promptText = String(genLeaf.prompt || "").trim();
+    const width = toPositiveSize(asset.width);
+    const height = toPositiveSize(asset.height);
+    const base = {
+      id: assetId,
+      postId: normalizeId(asset.assetId),
+      createdAt: asset.createTime || asset.updateTime || "",
+      promptText,
+      mimeType,
+      originalPostId: "",
+      parentPostId: normalizeId(conversationId),
+      rootPostId: normalizeId(conversationId),
+      postOrder: order,
+      mediaWidth: width,
+      mediaHeight: height,
+      isPortrait: width && height ? height > width : null
+    };
+    if (isVideo) {
+      return {
+        ...base,
+        kind: "video",
+        url,
+        mediaUrl: url,
+        playbackUrl: url,
+        hdMediaUrl: "",
+        poster: previewKey ? optimizeThumbUrl(normalizeUrl(previewKey)) : "",
+        sourceImageUrl: previewKey ? normalizeUrl(previewKey) : "",
+        resolutionName: String(genLeaf.resolutionName || ""),
+        resolutionWidth: 0,
+        resolutionHeight: 0,
+        isHD: null
+      };
+    }
+    return {
+      ...base,
+      kind: "image",
+      url,
+      poster: optimizeThumbUrl(url),
+      childVideoIds: []
+    };
+  };
+
+  // Grid rows for a page of conversations: the tile shows each conversation's latest
+  // asset until the full variant list is hydrated from /responses on demand.
+  const extractConversationItems = (conversations, orderBase = 0) => {
     const videos = [];
     const images = [];
-    (posts || []).forEach((post) => {
+    (conversations || []).forEach((conv, index) => {
+      const conversationId = normalizeId(conv && conv.conversationId);
+      if (!conversationId) return;
+      const item = buildItemFromAsset(conv && conv.latestAssetMetadata, conversationId, orderBase + index);
+      if (!item) return;
+      if (item.kind === "image") images.push(item);
+      else videos.push(item);
+    });
+    return { videos, images };
+  };
+
+  // Every asset referenced anywhere in a conversation's responses, newest last.
+  const extractConversationAssets = (responses, conversationId, order) => {
+    const seen = new Set();
+    const items = [];
+    const take = (asset) => {
+      if (!asset) return;
+      const id = normalizeId(asset.assetId);
+      if (id && seen.has(id)) return;
+      if (id) seen.add(id);
+      const item = buildItemFromAsset(asset, conversationId, order);
+      if (item) items.push(item);
+    };
+    (responses || []).forEach((response) => {
+      if (!response) return;
+      (response.fileAttachmentAssetMetadata || []).forEach(take);
+      (response.assetMetadata || []).forEach(take);
+      if (response.latestAssetMetadata) take(response.latestAssetMetadata);
+    });
+    return items;
+  };
+
+  const extractItems = (posts, orderBase = 0) => {
+    const videos = [];
+    const images = [];
+    (posts || []).forEach((post, postIndex) => {
+      const videoStart = videos.length;
+      const imageStart = images.length;
       const imageItem = buildImageItem(post);
       if (imageItem) images.push(imageItem);
       const mainItem = buildItem(post);
@@ -1156,6 +1300,20 @@
           const childImage = buildImageItem(child, original.id || "");
           if (childImage) images.push(childImage);
         });
+      }
+      // Tag everything this post produced with the post it belongs to and that post's
+      // position in the API stream. The grid groups by these so it can mirror Grok's
+      // own saved view -- one tile per top-level post, in the order the API returns
+      // them -- instead of re-clustering and re-sorting by timestamp.
+      const rootPostId = normalizeId(post && post.id);
+      const postOrder = LEGACY_ORDER_BASE + orderBase + postIndex;
+      for (let i = videoStart; i < videos.length; i += 1) {
+        videos[i].rootPostId = rootPostId;
+        videos[i].postOrder = postOrder;
+      }
+      for (let i = imageStart; i < images.length; i += 1) {
+        images[i].rootPostId = rootPostId;
+        images[i].postOrder = postOrder;
       }
     });
     return { videos, images };
@@ -1893,12 +2051,84 @@
     modeState.seen = rebuilt;
   };
 
+  const fetchAndCacheV2Page = async (pageIndex) => {
+    const v2 = state.v2;
+    const token = v2.pageTokens[pageIndex] || null;
+    const data = await fetchConversationsPage(token || undefined);
+    const conversations = data && Array.isArray(data.conversations) ? data.conversations : [];
+    const extracted = extractConversationItems(conversations, pageIndex * CONV_PAGE_SIZE);
+    const items = [];
+    [...(extracted.videos || []), ...(extracted.images || [])].forEach((item) => {
+      const minItem = item.kind === "image" ? minimizeImageItem(item) : minimizeVideoItem(item);
+      if (!minItem) return;
+      if (minItem.kind === "video" && !ensurePlayableVideoItem(minItem)) return;
+      const key = `${minItem.rootPostId}:${minItem.postId}`;
+      if (v2.seen.has(key)) return;
+      v2.seen.add(key);
+      items.push(minItem);
+    });
+    v2.pageCache.set(pageIndex, items);
+    v2.totalLoaded += items.length;
+    const nextToken = data && data.nextPageToken ? data.nextPageToken : null;
+    if (nextToken && v2.pageTokens[pageIndex + 1] === undefined) {
+      v2.pageTokens[pageIndex + 1] = nextToken;
+    }
+    if (!nextToken || !conversations.length) v2.exhausted = true;
+    invalidateGroupsMemo();
+  };
+
+  // A conversation tile starts out holding only its latest asset. Pull the rest in when
+  // the tile is opened or downloaded, and fold them into the same cache page so the
+  // grouping picks them up as variants without any special-casing.
+  const hydrateConversationVariants = async (conversationId) => {
+    const cid = normalizeId(conversationId);
+    const v2 = state.v2;
+    if (!cid || v2.hydrated.has(cid)) return false;
+    v2.hydrated.add(cid);
+    let responses;
+    try {
+      responses = await fetchConversationResponses(cid);
+    } catch (error) {
+      v2.hydrated.delete(cid);
+      return false;
+    }
+    let pageIndex = -1;
+    let order = 0;
+    v2.pageCache.forEach((pageItems, key) => {
+      (pageItems || []).forEach((entry) => {
+        if (entry && normalizeId(entry.rootPostId) === cid) {
+          pageIndex = key;
+          order = Number.isFinite(entry.postOrder) ? entry.postOrder : order;
+        }
+      });
+    });
+    if (pageIndex < 0) return false;
+    const assets = extractConversationAssets(responses, cid, order);
+    const pageItems = v2.pageCache.get(pageIndex) || [];
+    let added = 0;
+    assets.forEach((item) => {
+      const minItem = item.kind === "image" ? minimizeImageItem(item) : minimizeVideoItem(item);
+      if (!minItem) return;
+      if (minItem.kind === "video" && !ensurePlayableVideoItem(minItem)) return;
+      const key = `${cid}:${minItem.postId}`;
+      if (v2.seen.has(key)) return;
+      v2.seen.add(key);
+      pageItems.push(minItem);
+      added += 1;
+    });
+    if (!added) return false;
+    v2.pageCache.set(pageIndex, pageItems);
+    v2.totalLoaded += added;
+    invalidateGroupsMemo();
+    return true;
+  };
+
   const fetchAndCachePage = async (mode, pageIndex) => {
     const modeState = getModeState(mode);
     const cursor = modeState.pageCursors[pageIndex] || null;
     const data = await fetchPage(cursor || undefined);
     const posts = data && data.posts ? data.posts : [];
-    const extracted = extractItems(posts);
+    const extracted = extractItems(posts, pageIndex * LIMIT);
     const rawItems = mode === "images" ? extracted.images || [] : extracted.videos || [];
     const deduped = mode === "images" ? dedupeImageItems(rawItems) : dedupeItems(rawItems);
     const items = [];
@@ -1943,21 +2173,26 @@
       if (isGridMode()) {
         const requiredGroups = (pageIndex + 1) * GRID_TILES_PER_PAGE;
         let safety = 0;
-        while ((!videoState.exhausted || !imageState.exhausted) && safety < 500) {
-          const totalLoaded = (videoState.totalLoaded || 0) + (imageState.totalLoaded || 0);
-          if (totalLoaded >= requiredGroups) {
-            const groupsSoFar = computeAllUnifiedItems().length;
-            if (groupsSoFar >= requiredGroups) break;
-          }
+        const everythingExhausted = () =>
+          state.v2.exhausted && videoState.exhausted && imageState.exhausted;
+        while (!everythingExhausted() && safety < 500) {
+          if (computeAllUnifiedItems().length >= requiredGroups) break;
           let didFetch = false;
-          if (await fetchOneIfPossible("videos")) didFetch = true;
-          if (await fetchOneIfPossible("images")) didFetch = true;
+          // Conversations hold everything created since the v2 rollout, so walk them
+          // first and only fall back to the legacy liked list once they run out.
+          if (!state.v2.exhausted) {
+            await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
+            didFetch = true;
+          } else {
+            if (await fetchOneIfPossible("videos")) didFetch = true;
+            if (await fetchOneIfPossible("images")) didFetch = true;
+          }
           if (!didFetch) break;
           safety += 1;
         }
         const totalGroups = computeAllUnifiedItems().length;
         const lastUIPage = Math.max(0, Math.ceil(totalGroups / GRID_TILES_PER_PAGE) - 1);
-        const bothExhausted = videoState.exhausted && imageState.exhausted;
+        const bothExhausted = everythingExhausted();
         const safePage = bothExhausted
           ? Math.max(0, Math.min(pageIndex, lastUIPage))
           : pageIndex;
@@ -2017,6 +2252,11 @@
           if (!gridView) prunePageCache(mode, ms.maxPageLoaded);
         }
       };
+      let v2Safety = 0;
+      while (!state.v2.exhausted && v2Safety < 2000) {
+        await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
+        v2Safety += 1;
+      }
       await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
       let lastPage;
       if (gridView) {
@@ -2070,7 +2310,9 @@
           parentPostId: item.parentPostId,
           mediaWidth: item.mediaWidth,
           mediaHeight: item.mediaHeight,
-          isPortrait: item.isPortrait
+          isPortrait: item.isPortrait,
+          rootPostId: item.rootPostId || "",
+          postOrder: item.postOrder
         }
       : null;
 
@@ -2090,7 +2332,9 @@
           childVideoIds: item.childVideoIds || [],
           mediaWidth: item.mediaWidth,
           mediaHeight: item.mediaHeight,
-          isPortrait: item.isPortrait
+          isPortrait: item.isPortrait,
+          rootPostId: item.rootPostId || "",
+          postOrder: item.postOrder
         }
       : null;
 
@@ -2162,9 +2406,19 @@
     invalidateGroupsMemo(mode);
   };
 
+  const resetV2State = () => {
+    state.v2.exhausted = false;
+    state.v2.pageCache.clear();
+    state.v2.pageTokens = [null];
+    state.v2.seen = new Set();
+    state.v2.totalLoaded = 0;
+    state.v2.hydrated = new Set();
+  };
+
   const resetAllModes = () => {
     resetModeState("videos");
     resetModeState("images");
+    resetV2State();
     state.items = [];
     state.videoItems = [];
     state.imageItems = [];
@@ -2228,122 +2482,71 @@
     }
   };
 
-  // Union-find over every loaded post id, linked by the same original/parent/child
-  // relations the download cascade uses, so the grid clusters a post exactly the way
-  // downloads do. Returns a Map of postId -> cluster root id.
-  const buildPostClusterMap = () => {
-    const parent = new Map();
-    const ensure = (id) => {
-      if (!parent.has(id)) parent.set(id, id);
-    };
-    const find = (id) => {
-      let root = id;
-      while (parent.get(root) !== root) root = parent.get(root);
-      let node = id;
-      while (parent.get(node) !== root) {
-        const next = parent.get(node);
-        parent.set(node, root);
-        node = next;
-      }
-      return root;
-    };
-    const union = (a, b) => {
-      ensure(a);
-      ensure(b);
-      const ra = find(a);
-      const rb = find(b);
-      if (ra !== rb) parent.set(rb, ra);
-    };
-    ["videos", "images"].forEach((mode) => {
-      getModeState(mode).pageCache.forEach((pageItems) => {
+  // Grok's own saved view renders one tile per top-level post returned by
+  // /rest/media/post/list, in the exact order the API returns them, with that post's
+  // videos and child images nested under the parent image. The API orders posts by
+  // cluster recency, not by parent createTime, so re-sorting client-side by timestamp
+  // scatters recent media instead of surfacing it. Mirror the API: group by the post an
+  // item was extracted from, order by position in the stream, lead with the parent image.
+  const buildPostOrderedGridGroups = () => {
+    const buckets = new Map();
+    const caches = [state.v2.pageCache, getModeState("videos").pageCache, getModeState("images").pageCache];
+    caches.forEach((cache) => {
+      cache.forEach((pageItems) => {
         (pageItems || []).forEach((entry) => {
           if (!entry) return;
-          const pid = normalizeId(entry.postId);
-          if (!pid) return;
-          ensure(pid);
-          [entry.originalPostId, entry.parentPostId].forEach((linkId) => {
-            const l = normalizeId(linkId);
-            if (l) union(pid, l);
-          });
-          (Array.isArray(entry.childVideoIds) ? entry.childVideoIds : []).forEach((cid) => {
-            const c = normalizeId(cid);
-            if (c) union(pid, c);
-          });
+          const root = normalizeId(entry.rootPostId) || normalizeId(entry.postId);
+          if (!root) return;
+          let bucket = buckets.get(root);
+          if (!bucket) {
+            bucket = { rootPostId: root, order: Number.MAX_SAFE_INTEGER, videos: [], images: [] };
+            buckets.set(root, bucket);
+          }
+          const order = Number(entry.postOrder);
+          if (Number.isFinite(order) && order < bucket.order) bucket.order = order;
+          if (entry.kind === "image") bucket.images.push(entry);
+          else bucket.videos.push(entry);
         });
       });
     });
-    const map = new Map();
-    parent.forEach((_, id) => map.set(id, find(id)));
-    return map;
-  };
-
-  // Merge a set of per-mode groups that belong to the same physical post into one
-  // unified group whose variants hold both videos and images (videos first).
-  const buildMergedUnifiedGroup = (members) => {
-    const direction = state.sortOrder === "asc" ? 1 : -1;
-    const videos = [];
-    const images = [];
-    members.forEach((group) => {
-      (group && Array.isArray(group.variants) ? group.variants : []).forEach((variant) => {
-        if (!variant) return;
-        if (variant.kind === "image") images.push(variant);
-        else videos.push(variant);
-      });
+    const ordered = Array.from(buckets.values()).sort((a, b) => a.order - b.order);
+    if (state.sortOrder === "asc") ordered.reverse();
+    const groups = [];
+    ordered.forEach((bucket) => {
+      const videos = dedupeItems(bucket.videos).filter((entry) => ensurePlayableVideoItem(entry));
+      const images = dedupeImageItems(bucket.images);
+      // The parent image is the top-level post itself, so its own id is the bucket root.
+      const parentImage = images.find((img) => normalizeId(img && img.postId) === bucket.rootPostId) || null;
+      const rest = images
+        .filter((img) => img !== parentImage)
+        .concat(videos)
+        .sort((a, b) => toTime(a && a.createdAt) - toTime(b && b.createdAt));
+      // Legacy posts lead with their parent image. Conversation buckets have no such
+      // member (their root is a conversation id, not a post id), so they lead with the
+      // newest asset -- what Grok puts on the tile, and stable before and after lazy
+      // hydration adds the older assets. The variant strip re-sorts chronologically for
+      // display either way, so this only decides the thumbnail.
+      const variants = parentImage ? [parentImage].concat(rest) : rest.slice().reverse();
+      if (!variants.length) return;
+      const primary = variants[0];
+      const latest = variants.reduce((max, entry) => Math.max(max, toTime(entry && entry.createdAt)), 0);
+      const merged = {
+        ...primary,
+        groupId: bucket.rootPostId,
+        variants,
+        activeIndex: 0,
+        isGroup: variants.length > 1,
+        groupCount: variants.length,
+        groupSortKey: bucket.order,
+        groupLatestTime: latest
+      };
+      state.groupOrder.set(bucket.rootPostId, bucket.order);
+      state.groupLatest.set(bucket.rootPostId, latest);
+      variants.forEach((variant) => rememberGroupAlias(variant && variant.postId, bucket.rootPostId));
+      rememberGroupAlias(merged.postId, bucket.rootPostId);
+      groups.push(merged);
     });
-    const byTime = (a, b) => (toTime(a.createdAt) - toTime(b.createdAt)) * direction;
-    const sortedVideos = dedupeItems(videos).slice().sort(byTime);
-    const sortedImages = dedupeImageItems(images).slice().sort(byTime);
-    const sorted = sortedVideos.concat(sortedImages);
-    if (!sorted.length) return members[0];
-    // Prefer a video group's id as the representative (matches folder naming) and
-    // put a video first so the tile shows a video thumbnail when one exists.
-    const videoMember = members.find(
-      (group) => group && Array.isArray(group.variants) && group.variants.some((v) => v && v.kind !== "image")
-    );
-    const repMember = videoMember || members[0];
-    const groupId = normalizeId(repMember && repMember.groupId) || normalizeId(sorted[0].postId);
-    const primary = sorted[0];
-    const latestTime = toTime(primary && primary.createdAt);
-    const merged = {
-      ...primary,
-      groupId,
-      variants: sorted,
-      activeIndex: 0,
-      isGroup: sorted.length > 1,
-      groupCount: sorted.length,
-      groupSortKey: direction === "asc" ? latestTime : -latestTime
-    };
-    sorted.forEach((variant) => rememberGroupAlias(variant && variant.postId, groupId));
-    rememberGroupAlias(merged.postId, groupId);
-    return merged;
-  };
-
-  const mergeUnifiedGroupsAcrossModes = (unifiedGroups) => {
-    const groups = (unifiedGroups || []).filter(
-      (group) => group && Array.isArray(group.variants) && group.variants.length
-    );
-    if (groups.length <= 1) return groups.slice();
-    const clusterMap = buildPostClusterMap();
-    const clusters = new Map();
-    groups.forEach((group, index) => {
-      let key = "";
-      const variants = group.variants || [];
-      for (let i = 0; i < variants.length; i += 1) {
-        const pid = normalizeId(variants[i] && variants[i].postId);
-        if (pid && clusterMap.has(pid)) {
-          key = clusterMap.get(pid);
-          break;
-        }
-      }
-      if (!key) key = normalizeId(group.groupId) || `solo-${index}`;
-      if (!clusters.has(key)) clusters.set(key, []);
-      clusters.get(key).push(group);
-    });
-    const result = [];
-    clusters.forEach((members) => {
-      result.push(members.length === 1 ? members[0] : buildMergedUnifiedGroup(members));
-    });
-    return result;
+    return groups;
   };
 
   let unifiedItemsMemo = { key: "", result: null };
@@ -2352,10 +2555,7 @@
     if (unifiedItemsMemo.result && unifiedItemsMemo.key === key) {
       return unifiedItemsMemo.result;
     }
-    const videoGroups = computeAllGroupsForMode("videos");
-    const imageGroups = computeAllGroupsForMode("images");
-    const merged = mergeUnifiedGroupsAcrossModes([...videoGroups, ...imageGroups]);
-    const result = sortByCreatedAt(merged);
+    const result = buildPostOrderedGridGroups();
     unifiedItemsMemo = { key, result };
     return result;
   };
@@ -2392,7 +2592,7 @@
     if (isGridMode()) {
       const totalGroups = computeAllUnifiedItems().length;
       const pages = Math.max(1, Math.ceil(totalGroups / GRID_TILES_PER_PAGE));
-      return bothExhausted ? pages : pages + 1;
+      return bothExhausted && state.v2.exhausted ? pages : pages + 1;
     }
     const maxLoaded = Math.max(videoState.maxPageLoaded, imageState.maxPageLoaded);
     const base = Math.max(1, maxLoaded + 1);
@@ -2480,7 +2680,7 @@
     const cursor = modeState.pageCursors[pageIdx] || null;
     const data = await fetchPage(cursor || undefined);
     const posts = data && data.posts ? data.posts : [];
-    const extracted = extractItems(posts);
+    const extracted = extractItems(posts, pageIdx * LIMIT);
     const rawItems = mode === "images" ? extracted.images || [] : extracted.videos || [];
     const deduped = mode === "images" ? dedupeImageItems(rawItems) : dedupeItems(rawItems);
     const fresh = [];
@@ -3910,7 +4110,16 @@
   };
 
   const downloadGroup = async (groupArg, options) => {
-    const group = groupArg || state.items[state.selectedIndex];
+    let group = groupArg || state.items[state.selectedIndex];
+    // Conversation tiles are lazily hydrated, so pull the full asset list before the
+    // variant-count check below or the folder would hold only the latest item.
+    const hydrateId = normalizeId(group && group.groupId);
+    if (hydrateId && (await hydrateConversationVariants(hydrateId))) {
+      const refreshed = computeAllUnifiedItems().find(
+        (entry) => normalizeId(entry && entry.groupId) === hydrateId
+      );
+      if (refreshed) group = refreshed;
+    }
     const skipFinalWait = !!(options && options.skipFinalWait);
     const bulk = !!(options && options.bulk);
     // When foldering (a folderName is supplied) a single-media post is valid and
@@ -4401,6 +4610,11 @@
           safety += 1;
         }
       };
+      let v2Safety = 0;
+      while (!state.v2.exhausted && v2Safety < 2000) {
+        await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
+        v2Safety += 1;
+      }
       await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
     } catch (error) {
       state.busy = false;
@@ -8630,6 +8844,15 @@
     if (!keepNestedRibbon) consumeNewGenerationHighlight(group);
     updateLightboxAutoplayIcon();
     if (isGridMode()) {
+      // A conversation tile arrives holding only its latest asset; pull the rest of the
+      // conversation in now so the strip shows every variant under it.
+      const conversationId = normalizeId(group && group.groupId);
+      hydrateConversationVariants(conversationId).then((changed) => {
+        if (!changed) return;
+        updateItems();
+        selectGroupByGroupId(conversationId);
+        if (lightboxEl && lightboxEl.classList.contains("open")) loadPlayer();
+      });
       maybeShowNestedGuide();
       if (state.mode === "videos") {
         const keepPostId = normalizeId((resolveActiveItem(group) || group).postId);
