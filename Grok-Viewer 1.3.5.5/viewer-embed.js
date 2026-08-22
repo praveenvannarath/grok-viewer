@@ -430,7 +430,10 @@
     if (getDownloadMode() !== "folder_once") return true;
     if (supportsFolderHandles() && !chosenFolderHandle) {
       const restored = await loadFolderHandle();
-      if (restored) chosenFolderHandle = restored;
+      if (restored) {
+        chosenFolderHandle = restored;
+        resetFolderProbeCache();
+      }
     }
     if (!supportsFolderHandles()) {
       const existingPath = sanitizeFolderPath(state.settings && state.settings.folderPath ? state.settings.folderPath : "");
@@ -460,6 +463,7 @@
     const picked = await pickFolderWithDialog();
     if (!picked) return false;
     chosenFolderHandle = picked.handle || null;
+    resetFolderProbeCache();
     if (chosenFolderHandle) saveFolderHandle(chosenFolderHandle);
     state.settings.folderPath = sanitizeFolderPath(picked.path || "Grok-Viewer");
     state.settings.downloadMode = "folder_once";
@@ -560,6 +564,7 @@
       return true;
     }
     chosenFolderHandle = picked.handle || null;
+    resetFolderProbeCache();
     if (chosenFolderHandle) saveFolderHandle(chosenFolderHandle);
     const folderPath = sanitizeFolderPath(picked.path || existing || "Grok-Viewer");
     state.settings.folderPath = folderPath || "Grok-Viewer";
@@ -4058,17 +4063,76 @@
     downloadFile(item);
   };
 
-  const resolveGroupFolderName = (group, options) => {
+  // Folder names for a post have changed shape over time (a video's id, then the
+  // parent post id, now a conversation id), and the checked-items path names a folder
+  // after the tile's own id while Download All uses the group id. Re-downloading a post
+  // that gained new media would therefore spawn a second folder beside the first. Probe
+  // every id this group is known by and reuse whichever folder is already on disk, so
+  // new images and videos land next to what was saved before.
+  const folderProbeCache = new Map();
+  const resetFolderProbeCache = () => folderProbeCache.clear();
+
+  const collectFolderCandidates = (group, canonical) => {
+    const candidates = [];
+    const push = (value) => {
+      const safe = sanitizeFolderSegment(value);
+      if (safe && !candidates.includes(safe)) candidates.push(safe);
+    };
+    push(canonical);
+    push(group && group.groupId);
+    push(group && group.postId);
+    push(group && group.rootPostId);
+    // Only ids that ARE this post -- parent/original links can belong to a different
+    // post that legitimately owns its own folder, so they must not be probed.
+    (group && Array.isArray(group.variants) ? group.variants : []).forEach((variant) => {
+      if (!variant) return;
+      push(variant.postId);
+      push(variant.rootPostId);
+      push(variant.id);
+    });
+    return candidates;
+  };
+
+  const findExistingPostFolder = async (group, canonical) => {
+    if (getDownloadMode() !== "folder_once" || !chosenFolderHandle) return "";
+    const candidates = collectFolderCandidates(group, canonical);
+    for (let i = 0; i < candidates.length; i += 1) {
+      const name = candidates[i];
+      if (folderProbeCache.has(name)) {
+        if (folderProbeCache.get(name)) return name;
+        continue;
+      }
+      let exists = false;
+      try {
+        await chosenFolderHandle.getDirectoryHandle(name, { create: false });
+        exists = true;
+      } catch (error) {
+        exists = false;
+      }
+      folderProbeCache.set(name, exists);
+      if (exists) return name;
+    }
+    return "";
+  };
+
+  const resolveGroupFolderName = async (group, options) => {
     const explicit = options && options.folderName ? sanitizeFolderSegment(options.folderName) : "";
-    if (explicit) return explicit;
-    const raw =
-      (group && (group.groupId || group.postId)) ||
-      (group &&
-        group.variants &&
-        group.variants[0] &&
-        (group.variants[0].postId || group.variants[0].id)) ||
-      "";
-    return sanitizeFolderSegment(raw) || "grok-post";
+    const canonical =
+      explicit ||
+      sanitizeFolderSegment(
+        (group && (group.groupId || group.postId)) ||
+          (group &&
+            group.variants &&
+            group.variants[0] &&
+            (group.variants[0].postId || group.variants[0].id)) ||
+          ""
+      ) ||
+      "grok-post";
+    const existing = await findExistingPostFolder(group, canonical);
+    if (existing) return existing;
+    // Nothing on disk yet: this run is about to create it, so later probes should see it.
+    folderProbeCache.set(canonical, true);
+    return canonical;
   };
 
   // Check whether <postFolder>/<name> is already on disk. Only reliable in folder
@@ -4154,7 +4218,7 @@
           seenVariantKeys.add(key);
           return true;
         });
-        const folderName = resolveGroupFolderName(group, options);
+        const folderName = await resolveGroupFolderName(group, options);
         let saved = 0;
         let failed = 0;
         let skippedExisting = 0;
@@ -4462,6 +4526,10 @@
     return item.postId ? `post:${item.postId}` : "";
   };
 
+  // The selected-items path only knows a tile's own post id; map it back to the group
+  // so its folder matches the one Download All would use for the same post.
+  const resolveAliasGroupId = (postId) => normalizeId(postGroupAlias.get(normalizeId(postId)));
+
   const groupHasVideo = (group) =>
     Boolean(
       group &&
@@ -4502,8 +4570,8 @@
       setStatus(`Downloading post ${i + 1} of ${orderedIds.length}...`);
       try {
         await downloadGroup(
-          { variants: fresh },
-          { skipFinalWait: true, bulk: true, folderName: postId }
+          { variants: fresh, groupId: resolveAliasGroupId(postId) || postId },
+          { skipFinalWait: true, bulk: true, folderName: resolveAliasGroupId(postId) || postId }
         );
         succeeded += 1;
       } catch (error) {
