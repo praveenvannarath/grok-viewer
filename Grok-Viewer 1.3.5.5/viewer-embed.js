@@ -660,51 +660,88 @@
       filter: { source: SOURCE }
     };
     if (cursor) body.cursor = cursor;
-    let response;
     try {
-      response = await fetch(API_URL, {
+      return await fetchJsonWithRetry(API_URL, {
         method: "POST",
         headers: { "content-type": "application/json" },
         credentials: "include",
         body: JSON.stringify(body)
       });
-    } catch (networkError) {
-      autoRefreshLastFetchStatus = -1;
-      throw networkError;
+    } catch (error) {
+      const match = /HTTP (\d+)/.exec(String((error && error.message) || ""));
+      autoRefreshLastFetchStatus = match ? Number(match[1]) : -1;
+      throw error;
     }
-    if (!response.ok) {
-      autoRefreshLastFetchStatus = response.status;
-      throw new Error(`HTTP ${response.status}`);
+  };
+
+  // Bulk walks (every conversation, then a /responses call per conversation) run into
+  // Grok's rate limiter. Keep one shared cooldown so a 429 anywhere pauses every later
+  // request instead of each caller hammering on independently, and honour Retry-After.
+  let apiCooldownUntil = 0;
+  const RATE_LIMIT_BASE_MS = 2000;
+  const RATE_LIMIT_MAX_MS = 30000;
+
+  const waitForApiCooldown = async () => {
+    const now = Date.now();
+    if (apiCooldownUntil > now) await sleep(apiCooldownUntil - now);
+  };
+
+  const noteRateLimit = (response, attempt) => {
+    let waitMs = Math.min(RATE_LIMIT_BASE_MS * Math.pow(2, attempt), RATE_LIMIT_MAX_MS);
+    try {
+      const header = response && response.headers ? response.headers.get("retry-after") : "";
+      const seconds = Number(header);
+      if (Number.isFinite(seconds) && seconds > 0) {
+        waitMs = Math.min(seconds * 1000, RATE_LIMIT_MAX_MS);
+      }
+    } catch (error) {}
+    apiCooldownUntil = Date.now() + waitMs;
+    return waitMs;
+  };
+
+  const fetchJsonWithRetry = async (url, init, attempts = 6) => {
+    let lastError = null;
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      await waitForApiCooldown();
+      let response;
+      try {
+        response = await fetch(url, init);
+      } catch (networkError) {
+        lastError = networkError;
+        await sleep(Math.min(RATE_LIMIT_BASE_MS * Math.pow(2, attempt), RATE_LIMIT_MAX_MS));
+        continue;
+      }
+      if (response.status === 429) {
+        const waitMs = noteRateLimit(response, attempt);
+        lastError = new Error("HTTP 429");
+        setStatus(`Rate limited by Grok; waiting ${Math.round(waitMs / 1000)}s...`);
+        continue;
+      }
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return response.json();
     }
-    return response.json();
+    throw lastError || new Error("request failed");
   };
 
   const fetchConversationsPage = async (pageToken) => {
     const params = new URLSearchParams({ pageSize: String(CONV_PAGE_SIZE), kind: CONV_KIND });
     if (pageToken) params.set("pageToken", pageToken);
-    let response;
     try {
-      response = await fetch(`${CONV_LIST_URL}?${params.toString()}`, {
+      return await fetchJsonWithRetry(`${CONV_LIST_URL}?${params.toString()}`, {
         method: "GET",
         credentials: "include"
       });
-    } catch (networkError) {
-      autoRefreshLastFetchStatus = -1;
-      throw networkError;
+    } catch (error) {
+      const match = /HTTP (\d+)/.exec(String((error && error.message) || ""));
+      autoRefreshLastFetchStatus = match ? Number(match[1]) : -1;
+      throw error;
     }
-    if (!response.ok) {
-      autoRefreshLastFetchStatus = response.status;
-      throw new Error(`HTTP ${response.status}`);
-    }
-    return response.json();
   };
 
   const fetchConversationResponses = async (conversationId) => {
     if (!conversationId) return [];
     const url = `${CONV_LIST_URL}/${encodeURIComponent(conversationId)}/responses?conversationKind=${CONV_KIND}`;
-    const response = await fetch(url, { method: "GET", credentials: "include" });
-    if (!response.ok) throw new Error(`responses HTTP ${response.status}`);
-    const data = await response.json();
+    const data = await fetchJsonWithRetry(url, { method: "GET", credentials: "include" });
     return data && Array.isArray(data.responses) ? data.responses : [];
   };
 
@@ -4697,22 +4734,10 @@
       const exhaustConversations = async () => {
         let safety = 0;
         while (!state.v2.exhausted && safety < 2000) {
-          const pageIndex = state.v2.pageTokens.length - 1;
-          let lastError = null;
-          for (let attempt = 0; attempt < 3; attempt += 1) {
-            try {
-              await fetchAndCacheV2Page(pageIndex);
-              lastError = null;
-              break;
-            } catch (error) {
-              lastError = error;
-              await sleep(500 * (attempt + 1));
-            }
-          }
-          if (lastError) throw lastError;
+          await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
           safety += 1;
           setStatus(`Loading conversations... ${state.v2.totalLoaded} items`);
-          await sleep(120);
+          await sleep(250);
         }
       };
       await exhaustConversations();
