@@ -4754,6 +4754,23 @@
     }
     invalidateGroupsMemo();
     updateItems();
+    // Conversation tiles hold only their latest asset until hydrated. Without this pass
+    // every conversation is grouped as a single item and written as its own one-file
+    // folder -- the per-post download looks right only because it hydrates first.
+    const conversationIds = new Set();
+    state.v2.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        const rootId = normalizeId(entry && entry.rootPostId);
+        if (rootId) conversationIds.add(rootId);
+      });
+    });
+    const pendingConversations = Array.from(conversationIds);
+    for (let i = 0; i < pendingConversations.length; i += 1) {
+      setStatus(`Loading post contents ${i + 1}/${pendingConversations.length}...`);
+      await hydrateConversationVariants(pendingConversations[i]);
+    }
+    invalidateGroupsMemo();
+    updateItems();
     const groups = computeAllUnifiedItems();
     if (!groups.length) {
       state.busy = false;
@@ -4783,7 +4800,9 @@
           skipped.push(index);
           continue;
         }
-        const media = collectMediaForPostIds(seedIds);
+        // Same collector the per-post download uses: cascade links for legacy posts,
+        // shared root for conversations, whose assets have no links to each other.
+        const media = collectMediaUnderPost(group);
         const fresh = [];
         media.forEach((item) => {
           const key = mediaDedupKey(item);
