@@ -4374,19 +4374,38 @@
       : [item.postId].filter(Boolean);
     if (!seedIds.length) return [];
     const allIds = collectCascadingPostIds(seedIds);
-    const videoState = getModeState("videos");
+    // Same two blind spots collectMediaUnderPost had: conversation videos live in the
+    // v2 cache, not the per-mode one, and they link to the conversation rather than to
+    // each other -- so match on the shared root as well as the cascade.
+    const rootIds = new Set();
+    const addRoot = (value) => {
+      const norm = normalizeId(value);
+      if (norm) rootIds.add(norm);
+    };
+    addRoot(item.groupId);
+    addRoot(item.rootPostId);
+    (item.variants || []).forEach((variant) => addRoot(variant && variant.rootPostId));
     const seen = new Set();
     const videos = [];
-    videoState.pageCache.forEach((pageItems) => {
-      (pageItems || []).forEach((entry) => {
-        if (!entry || !entry.postId) return;
-        const pid = String(entry.postId);
-        if (!allIds.has(pid) || seen.has(pid)) return;
-        seen.add(pid);
-        videos.push(entry);
-      });
+    forEachLoadedEntry((entry) => {
+      if (!entry || !entry.postId) return;
+      if (entry.kind === "image") return;
+      const pid = String(entry.postId);
+      if (seen.has(pid)) return;
+      if (!allIds.has(pid) && !rootIds.has(normalizeId(entry.rootPostId))) return;
+      seen.add(pid);
+      videos.push(entry);
     });
     return videos;
+  };
+
+  // A conversation group is rooted on a conversation id, which is never one of its own
+  // members' post ids; a legacy post's root is its own top-level post.
+  const isConversationGroup = (item) => {
+    const rootId = normalizeId(item && item.groupId);
+    if (!rootId) return false;
+    const members = (item && item.variants) || [];
+    return !members.some((member) => member && normalizeId(member.postId) === rootId);
   };
 
   const collectMediaUnderPost = (item) => {
@@ -4436,6 +4455,8 @@
 
   const deleteAllVideosForItem = async (item) => {
     if (state.busy) return;
+    // Hydrate first, or a conversation tile only knows about its latest asset.
+    await hydrateConversationVariants(normalizeId(item && item.groupId));
     const videos = collectVideosUnderPost(item);
     if (!videos.length) {
       showToast("No videos found under this post.", "info");
@@ -4443,7 +4464,13 @@
     }
     const ids = videos.map((v) => v && v.postId).filter(Boolean);
     if (!ids.length) return;
-    if (!window.confirm(`Delete ${ids.length} video${ids.length === 1 ? "" : "s"} under this post?`)) return;
+    // Conversation assets are not posts in the old sense, and /rest/media/post/delete is
+    // not confirmed to remove one without affecting the rest of the conversation. Say so
+    // rather than implying this behaves like a legacy per-video delete.
+    const warning = isConversationGroup(item)
+      ? "\n\nThis is a conversation post. Deleting its videos individually is not confirmed to behave the same way as for older posts and may affect the whole conversation."
+      : "";
+    if (!window.confirm(`Delete ${ids.length} video${ids.length === 1 ? "" : "s"} under this post?${warning}`)) return;
     playActionAudio("delete");
     state.busy = true;
     updateActionButtons();
