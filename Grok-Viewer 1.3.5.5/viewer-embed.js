@@ -17,6 +17,7 @@
   // and are ordered after every conversation, which is chronologically correct because
   // v2 covers everything created after the rollout.
   const CONV_LIST_URL = "/rest/app-chat/conversations";
+  const ASSET_URL = "/rest/assets";
   const CONV_KIND = "CONVERSATION_KIND_IMAGINE";
   const CONV_PAGE_SIZE = 40;
   const LEGACY_ORDER_BASE = 1e9;
@@ -2898,8 +2899,36 @@
 
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+  // Captured from grok.com itself 2026-08-23: v2 media is removed with a plain
+  // DELETE /rest/assets/{assetId} (200, no body). The legacy POST
+  // /rest/media/post/delete answers 404 "Media post not found" for the same id.
+  const deleteConversationAsset = async (assetId) => {
+    const id = normalizeId(assetId);
+    if (!id) return { ok: false };
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      await waitForApiCooldown();
+      let response;
+      try {
+        response = await fetch(`${ASSET_URL}/${encodeURIComponent(id)}`, {
+          method: "DELETE",
+          credentials: "include"
+        });
+      } catch (error) {
+        await sleep(Math.min(RATE_LIMIT_BASE_MS * Math.pow(2, attempt), RATE_LIMIT_MAX_MS));
+        continue;
+      }
+      if (response.status === 429) {
+        noteRateLimit(response, attempt);
+        continue;
+      }
+      return { ok: response.ok, status: response.status };
+    }
+    return { ok: false, status: 0 };
+  };
+
   const deletePostDirect = async (postId) => {
     if (!postId) return { ok: false };
+    if (isConversationAssetId(postId)) return deleteConversationAsset(postId);
     const response = await fetch(DELETE_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -2911,6 +2940,14 @@
 
   const deletePost = async (postId) => {
     if (!postId) return { ok: false };
+    if (isConversationAssetId(postId)) {
+      // The favorites fallback speaks the legacy endpoint, which 404s on assets.
+      try {
+        return await deleteConversationAsset(postId);
+      } catch (error) {
+        return { ok: false };
+      }
+    }
     try {
       const direct = await deletePostDirect(postId);
       if (direct.ok) return direct;
@@ -3234,10 +3271,6 @@
   const deleteItem = async (item) => {
     const targetItem = resolveActiveItem(item);
     if (!targetItem || !targetItem.postId || state.busy) return;
-    if (isConversationGroup(item) || isConversationAssetId(targetItem.postId)) {
-      showToast(CONVERSATION_DELETE_UNSUPPORTED, "info");
-      return;
-    }
     if (!window.confirm("Delete this post and all related posts (original + variants + children)?")) return;
     playActionAudio("delete");
     state.busy = true;
@@ -4407,9 +4440,6 @@
   // 404 {"code":5,"message":"Media post not found"}. Conversation media simply is not
   // deletable through the legacy endpoint, so every delete aimed at it is a doomed
   // request. Block those actions with an honest message instead of firing them.
-  const CONVERSATION_DELETE_UNSUPPORTED =
-    "Deleting conversation media isn't supported yet — Grok's delete endpoint rejects these posts.";
-
   const isConversationAssetId = (postId) => {
     const target = normalizeId(postId);
     if (!target) return false;
@@ -4487,10 +4517,6 @@
     }
     const ids = videos.map((v) => v && v.postId).filter(Boolean);
     if (!ids.length) return;
-    if (isConversationGroup(item) || ids.some(isConversationAssetId)) {
-      showToast(CONVERSATION_DELETE_UNSUPPORTED, "info");
-      return;
-    }
     if (!window.confirm(`Delete ${ids.length} video${ids.length === 1 ? "" : "s"} under this post?`)) return;
     playActionAudio("delete");
     state.busy = true;
@@ -4693,18 +4719,9 @@
 
   const deleteCheckedItems = async () => {
     if (state.busy) return;
-    const allSelected = Array.from(state.selectedPostIds).filter(Boolean);
-    const conversationSelected = allSelected.filter(isConversationAssetId);
-    const ids = allSelected.filter((id) => !isConversationAssetId(id));
-    if (conversationSelected.length && !ids.length) {
-      showToast(CONVERSATION_DELETE_UNSUPPORTED, "info");
-      return;
-    }
+    const ids = Array.from(state.selectedPostIds).filter(Boolean);
     if (!ids.length) return;
-    const skipNote = conversationSelected.length
-      ? `\n\n${conversationSelected.length} conversation post${conversationSelected.length === 1 ? " is" : "s are"} selected and will be skipped — Grok's delete endpoint rejects them.`
-      : "";
-    if (!window.confirm(`Delete ${ids.length} checked post${ids.length === 1 ? "" : "s"} (and all related)?${skipNote}`)) return;
+    if (!window.confirm(`Delete ${ids.length} checked post${ids.length === 1 ? "" : "s"} (and all related)?`)) return;
     playActionAudio("delete");
     state.busy = true;
     updateActionButtons();
