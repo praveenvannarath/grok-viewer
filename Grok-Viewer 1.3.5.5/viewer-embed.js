@@ -10,23 +10,12 @@
   const POST_GET_URL = "/rest/media/post/get";
   const REGEN_CONVERSATION_URL = "/rest/app-chat/conversations/new";
   const LIMIT = 40;
-  // Grok migrated Imagine to a conversation model. New generations never enter
-  // /rest/media/post/list (they carry no userInteractionStatus), so the viewer reads
-  // them from the same endpoint grok.com/imagine/saved uses. One conversation = one
-  // tile; its assets are the variants. Legacy liked posts still come from the old list
-  // and are ordered after every conversation, which is chronologically correct because
-  // v2 covers everything created after the rollout.
-  const CONV_LIST_URL = "/rest/app-chat/conversations";
+  // The grid loads from /rest/assets: one flat, strictly newest-first stream covering
+  // every post -- both Imagine conversation media and legacy liked posts -- with the
+  // conversation id inline on each asset, so tiles group without a follow-up request.
   const ASSET_URL = "/rest/assets";
-  // /rest/assets is the one source that covers everything: 4588 assets over 2586
-  // conversations spanning 2025-09 to now, strictly newest-first, both v2 conversation
-  // media and legacy liked posts, with the conversation id inline. It replaces walking
-  // conversations and hydrating each one (~2650 requests) with ~77.
   const ASSETS_PAGE_SIZE = 60;
   const ASSETS_WORKSPACE = "WORKSPACE_KIND_IMAGINE_ALL";
-  const CONV_KIND = "CONVERSATION_KIND_IMAGINE";
-  const CONV_PAGE_SIZE = 40;
-  const LEGACY_ORDER_BASE = 1e9;
   const GRID_TILES_PER_PAGE = 40;
   const SOURCE = "MEDIA_POST_SOURCE_LIKED";
   const REGEN_COOLDOWN_MS = 15000;
@@ -173,14 +162,6 @@
       pageTokens: [null],
       seen: new Set(),
       totalLoaded: 0
-    },
-    v2: {
-      exhausted: false,
-      pageCache: new Map(),
-      pageTokens: [null],
-      seen: new Set(),
-      totalLoaded: 0,
-      hydrated: new Set()
     },
     modeState: {
       videos: createModeState(),
@@ -737,21 +718,6 @@
     throw lastError || new Error("request failed");
   };
 
-  const fetchConversationsPage = async (pageToken) => {
-    const params = new URLSearchParams({ pageSize: String(CONV_PAGE_SIZE), kind: CONV_KIND });
-    if (pageToken) params.set("pageToken", pageToken);
-    try {
-      return await fetchJsonWithRetry(`${CONV_LIST_URL}?${params.toString()}`, {
-        method: "GET",
-        credentials: "include"
-      });
-    } catch (error) {
-      const match = /HTTP (\d+)/.exec(String((error && error.message) || ""));
-      autoRefreshLastFetchStatus = match ? Number(match[1]) : -1;
-      throw error;
-    }
-  };
-
   const fetchAssetsPage = async (pageToken) => {
     const params = new URLSearchParams({
       pageSize: String(ASSETS_PAGE_SIZE),
@@ -769,13 +735,6 @@
       autoRefreshLastFetchStatus = match ? Number(match[1]) : -1;
       throw error;
     }
-  };
-
-  const fetchConversationResponses = async (conversationId) => {
-    if (!conversationId) return [];
-    const url = `${CONV_LIST_URL}/${encodeURIComponent(conversationId)}/responses?conversationKind=${CONV_KIND}`;
-    const data = await fetchJsonWithRetry(url, { method: "GET", credentials: "include" });
-    return data && Array.isArray(data.responses) ? data.responses : [];
   };
 
   const isUnavailableUrlValue = (value) => {
@@ -1291,22 +1250,6 @@
     };
   };
 
-  // Grid rows for a page of conversations: the tile shows each conversation's latest
-  // asset until the full variant list is hydrated from /responses on demand.
-  const extractConversationItems = (conversations, orderBase = 0) => {
-    const videos = [];
-    const images = [];
-    (conversations || []).forEach((conv, index) => {
-      const conversationId = normalizeId(conv && conv.conversationId);
-      if (!conversationId) return;
-      const item = buildItemFromAsset(conv && conv.latestAssetMetadata, conversationId, orderBase + index);
-      if (!item) return;
-      if (item.kind === "image") images.push(item);
-      else videos.push(item);
-    });
-    return { videos, images };
-  };
-
   // The asset list carries its conversation inline, so a flat page of assets groups
   // into tiles with no follow-up request. Assets with no conversation (a handful) fall
   // back to standing alone under their own id.
@@ -1324,27 +1267,6 @@
       if (!conversationId) return;
       const item = buildItemFromAsset(asset, conversationId, orderBase + index);
       if (item) items.push(item);
-    });
-    return items;
-  };
-
-  // Every asset referenced anywhere in a conversation's responses, newest last.
-  const extractConversationAssets = (responses, conversationId, order) => {
-    const seen = new Set();
-    const items = [];
-    const take = (asset) => {
-      if (!asset) return;
-      const id = normalizeId(asset.assetId);
-      if (id && seen.has(id)) return;
-      if (id) seen.add(id);
-      const item = buildItemFromAsset(asset, conversationId, order);
-      if (item) items.push(item);
-    };
-    (responses || []).forEach((response) => {
-      if (!response) return;
-      (response.fileAttachmentAssetMetadata || []).forEach(take);
-      (response.assetMetadata || []).forEach(take);
-      if (response.latestAssetMetadata) take(response.latestAssetMetadata);
     });
     return items;
   };
@@ -1402,7 +1324,7 @@
       // own saved view -- one tile per top-level post, in the order the API returns
       // them -- instead of re-clustering and re-sorting by timestamp.
       const rootPostId = normalizeId(post && post.id);
-      const postOrder = LEGACY_ORDER_BASE + orderBase + postIndex;
+      const postOrder = orderBase + postIndex;
       for (let i = videoStart; i < videos.length; i += 1) {
         videos[i].rootPostId = rootPostId;
         videos[i].postOrder = postOrder;
@@ -2172,78 +2094,6 @@
     invalidateGroupsMemo();
   };
 
-  const fetchAndCacheV2Page = async (pageIndex) => {
-    const v2 = state.v2;
-    const token = v2.pageTokens[pageIndex] || null;
-    const data = await fetchConversationsPage(token || undefined);
-    const conversations = data && Array.isArray(data.conversations) ? data.conversations : [];
-    const extracted = extractConversationItems(conversations, pageIndex * CONV_PAGE_SIZE);
-    const items = [];
-    [...(extracted.videos || []), ...(extracted.images || [])].forEach((item) => {
-      const minItem = item.kind === "image" ? minimizeImageItem(item) : minimizeVideoItem(item);
-      if (!minItem) return;
-      if (minItem.kind === "video" && !ensurePlayableVideoItem(minItem)) return;
-      const key = `${minItem.rootPostId}:${minItem.postId}`;
-      if (v2.seen.has(key)) return;
-      v2.seen.add(key);
-      items.push(minItem);
-    });
-    v2.pageCache.set(pageIndex, items);
-    v2.totalLoaded += items.length;
-    const nextToken = data && data.nextPageToken ? data.nextPageToken : null;
-    if (nextToken && v2.pageTokens[pageIndex + 1] === undefined) {
-      v2.pageTokens[pageIndex + 1] = nextToken;
-    }
-    if (!nextToken || !conversations.length) v2.exhausted = true;
-    invalidateGroupsMemo();
-  };
-
-  // A conversation tile starts out holding only its latest asset. Pull the rest in when
-  // the tile is opened or downloaded, and fold them into the same cache page so the
-  // grouping picks them up as variants without any special-casing.
-  const hydrateConversationVariants = async (conversationId) => {
-    const cid = normalizeId(conversationId);
-    const v2 = state.v2;
-    if (!cid || v2.hydrated.has(cid)) return false;
-    v2.hydrated.add(cid);
-    let responses;
-    try {
-      responses = await fetchConversationResponses(cid);
-    } catch (error) {
-      v2.hydrated.delete(cid);
-      return false;
-    }
-    let pageIndex = -1;
-    let order = 0;
-    v2.pageCache.forEach((pageItems, key) => {
-      (pageItems || []).forEach((entry) => {
-        if (entry && normalizeId(entry.rootPostId) === cid) {
-          pageIndex = key;
-          order = Number.isFinite(entry.postOrder) ? entry.postOrder : order;
-        }
-      });
-    });
-    if (pageIndex < 0) return false;
-    const assets = extractConversationAssets(responses, cid, order);
-    const pageItems = v2.pageCache.get(pageIndex) || [];
-    let added = 0;
-    assets.forEach((item) => {
-      const minItem = item.kind === "image" ? minimizeImageItem(item) : minimizeVideoItem(item);
-      if (!minItem) return;
-      if (minItem.kind === "video" && !ensurePlayableVideoItem(minItem)) return;
-      const key = `${cid}:${minItem.postId}`;
-      if (v2.seen.has(key)) return;
-      v2.seen.add(key);
-      pageItems.push(minItem);
-      added += 1;
-    });
-    if (!added) return false;
-    v2.pageCache.set(pageIndex, pageItems);
-    v2.totalLoaded += added;
-    invalidateGroupsMemo();
-    return true;
-  };
-
   const fetchAndCachePage = async (mode, pageIndex) => {
     const modeState = getModeState(mode);
     const cursor = modeState.pageCursors[pageIndex] || null;
@@ -2527,20 +2377,10 @@
     state.assets.totalLoaded = 0;
   };
 
-  const resetV2State = () => {
-    state.v2.exhausted = false;
-    state.v2.pageCache.clear();
-    state.v2.pageTokens = [null];
-    state.v2.seen = new Set();
-    state.v2.totalLoaded = 0;
-    state.v2.hydrated = new Set();
-  };
-
   const resetAllModes = () => {
     resetModeState("videos");
     resetModeState("images");
     resetAssetsState();
-    resetV2State();
     state.items = [];
     state.videoItems = [];
     state.imageItems = [];
@@ -2983,7 +2823,7 @@
   // Captured from grok.com itself 2026-08-23: v2 media is removed with a plain
   // DELETE /rest/assets/{assetId} (200, no body). The legacy POST
   // /rest/media/post/delete answers 404 "Media post not found" for the same id.
-  const deleteConversationAsset = async (assetId) => {
+  const deleteAssetById = async (assetId) => {
     const id = normalizeId(assetId);
     if (!id) return { ok: false };
     for (let attempt = 0; attempt < 4; attempt += 1) {
@@ -3009,8 +2849,8 @@
 
   const deletePostDirect = async (postId) => {
     if (!postId) return { ok: false };
-    if (isConversationAssetId(postId)) {
-      const viaAsset = await deleteConversationAsset(postId);
+    if (isAssetStreamId(postId)) {
+      const viaAsset = await deleteAssetById(postId);
       if (viaAsset.ok) return viaAsset;
       // Legacy media appears in the asset list under the same id, but may still only be
       // removable through the old endpoint. Fall back rather than assume either way.
@@ -3035,7 +2875,7 @@
       // ignore and fallback
     }
     // The favorites fallback speaks the legacy endpoint, which 404s on v2 assets.
-    if (isConversationAssetId(postId)) return direct || { ok: false };
+    if (isAssetStreamId(postId)) return direct || { ok: false };
     const result = await sendToFavorites({ action: "grokViewerDeleteOne", postId });
     if (!result || !result.ok || !result.response) {
       return { ok: false };
@@ -4513,7 +4353,7 @@
   // 404 {"code":5,"message":"Media post not found"}. Conversation media simply is not
   // deletable through the legacy endpoint, so every delete aimed at it is a doomed
   // request. Block those actions with an honest message instead of firing them.
-  const isConversationAssetId = (postId) => {
+  const isAssetStreamId = (postId) => {
     const target = normalizeId(postId);
     if (!target) return false;
     let found = false;
@@ -4525,15 +4365,6 @@
       });
     });
     return found;
-  };
-
-  // A conversation group is rooted on a conversation id, which is never one of its own
-  // members' post ids; a legacy post's root is its own top-level post.
-  const isConversationGroup = (item) => {
-    const rootId = normalizeId(item && item.groupId);
-    if (!rootId) return false;
-    const members = (item && item.variants) || [];
-    return !members.some((member) => member && normalizeId(member.postId) === rootId);
   };
 
   const collectMediaUnderPost = (item) => {
