@@ -3198,7 +3198,7 @@
     state.busy = true;
     updateActionButtons();
     const isImages = state.mode === "images" && targetItem.url && isImage(targetItem.url, targetItem.mimeType);
-    const ids = Array.from(collectCascadingPostIds([targetItem.postId]));
+    const ids = Array.from(collectDeleteTargetIds([targetItem.postId]));
     if (!ids.length) {
       state.busy = false;
       updateActionButtons();
@@ -3499,27 +3499,34 @@
     beginDeleteAllRun("videos");
     updateActionButtons();
     setStatus("Deleting all videos...");
+    // Enumerate from the asset stream: it covers every post, legacy and conversation
+    // alike, where the legacy list stops at the v2 rollout and would silently skip
+    // everything newer.
     const totalIds = new Set();
     const allIds = [];
-    let cursor = undefined;
     let safety = 0;
-    while (true) {
-      const data = await fetchPage(cursor);
-      const posts = data && data.posts ? data.posts : [];
-      const extracted = extractItems(posts);
-      const videos = dedupeItems(extracted.videos || []);
-      for (let i = 0; i < videos.length; i += 1) {
-        const id = videos[i] && videos[i].postId ? videos[i].postId : "";
-        if (!id || totalIds.has(id)) continue;
+    while (!state.assets.exhausted && safety < 2000) {
+      await fetchAndCacheAssetsPage(state.assets.pageTokens.length - 1);
+      safety += 1;
+      setStatus(`Finding videos... ${state.assets.totalLoaded} items scanned`);
+    }
+    state.assets.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        if (!entry || entry.kind === "image") return;
+        const id = normalizeId(entry.postId);
+        if (!id || totalIds.has(id)) return;
         totalIds.add(id);
         allIds.push(id);
-      }
-      const nextCursor = data && data.nextCursor ? data.nextCursor : undefined;
-      if (!nextCursor) break;
-      cursor = nextCursor;
-      safety += 1;
-      if (safety > 200) break;
+      });
+    });
+    if (!allIds.length) {
+      endDeleteAllRun("videos");
+      setStatus("No videos found.");
+      showToast("No videos found.", "info");
+      updateActionButtons();
+      return;
     }
+    setStatus(`Deleting ${allIds.length} videos...`);
     const totalCount = Math.max(1, totalIds.size);
     let deletedCount = 0;
     showDeleteProgress(`Deleting videos ${deletedCount}/${totalCount}`, 0);
@@ -4367,6 +4374,30 @@
     return found;
   };
 
+  // Deleting a post has to take everything under it. Legacy posts are joined by cascade
+  // ids; asset-stream media has no such links between siblings and is joined only by its
+  // shared root, so expand both or a delete removes just the tile's primary asset.
+  const collectDeleteTargetIds = (seedIds) => {
+    const ids = collectCascadingPostIds(seedIds);
+    const seeds = new Set((seedIds || []).map(normalizeId).filter(Boolean));
+    const roots = new Set();
+    forEachLoadedEntry((entry) => {
+      if (!entry) return;
+      const pid = normalizeId(entry.postId);
+      if (pid && seeds.has(pid)) {
+        const root = normalizeId(entry.rootPostId);
+        if (root) roots.add(root);
+      }
+    });
+    if (!roots.size) return ids;
+    forEachLoadedEntry((entry) => {
+      if (!entry) return;
+      const pid = normalizeId(entry.postId);
+      if (pid && roots.has(normalizeId(entry.rootPostId))) ids.add(pid);
+    });
+    return ids;
+  };
+
   const collectMediaUnderPost = (item) => {
     if (!item) return [];
     const seedIds = item.variants && item.variants.length
@@ -4627,7 +4658,7 @@
     state.busy = true;
     updateActionButtons();
     updateDeleteCheckedButton();
-    const cascadeIds = Array.from(collectCascadingPostIds(ids));
+    const cascadeIds = Array.from(collectDeleteTargetIds(ids));
     const total = cascadeIds.length;
     const totalSafe = Math.max(1, total);
     let processed = 0;
@@ -5033,6 +5064,16 @@
   let regenCooldownTimer = null;
   let pendingRefreshAfterDelete = false;
 
+  const countLoadedVideos = () => {
+    let total = 0;
+    state.assets.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        if (entry && entry.kind !== "image") total += 1;
+      });
+    });
+    return total;
+  };
+
   const getCountSummary = () => {
     let totalPosts = 0;
     try {
@@ -5040,14 +5081,8 @@
     } catch (error) {
       totalPosts = state.items.length;
     }
-    let videoTotal = getModeState("videos").totalLoaded || 0;
-    // Same blind spot in the toolbar counter: without this it reads "0 videos" while
-    // the grid shows nothing but conversation videos.
-    state.assets.pageCache.forEach((pageItems) => {
-      (pageItems || []).forEach((entry) => {
-        if (entry && entry.kind !== "image") videoTotal += 1;
-      });
-    });
+    // The grid's videos come from the asset stream, not the per-mode caches.
+    const videoTotal = countLoadedVideos() || getModeState("videos").totalLoaded || 0;
     return { totalPosts, videoTotal };
   };
 
@@ -7596,7 +7631,7 @@
       downloadAllBtn.disabled = !hasAny || state.busy;
     }
     if (deleteAllBtn) {
-      const hasVideos = state.videoItems.length;
+      const hasVideos = countLoadedVideos() || state.videoItems.length;
       const currentDeleteRunning = isDeleteAllRunning("videos");
       deleteAllBtn.disabled = !hasVideos || currentDeleteRunning || (state.busy && !isBusyFromDeleteOnly());
     }
