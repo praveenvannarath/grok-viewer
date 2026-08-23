@@ -18,6 +18,12 @@
   // v2 covers everything created after the rollout.
   const CONV_LIST_URL = "/rest/app-chat/conversations";
   const ASSET_URL = "/rest/assets";
+  // /rest/assets is the one source that covers everything: 4588 assets over 2586
+  // conversations spanning 2025-09 to now, strictly newest-first, both v2 conversation
+  // media and legacy liked posts, with the conversation id inline. It replaces walking
+  // conversations and hydrating each one (~2650 requests) with ~77.
+  const ASSETS_PAGE_SIZE = 60;
+  const ASSETS_WORKSPACE = "WORKSPACE_KIND_IMAGINE_ALL";
   const CONV_KIND = "CONVERSATION_KIND_IMAGINE";
   const CONV_PAGE_SIZE = 40;
   const LEGACY_ORDER_BASE = 1e9;
@@ -161,6 +167,13 @@
     groupOrder: new Map(),
     groupLatest: new Map(),
     deleteAllRunning: { videos: false, images: false },
+    assets: {
+      exhausted: false,
+      pageCache: new Map(),
+      pageTokens: [null],
+      seen: new Set(),
+      totalLoaded: 0
+    },
     v2: {
       exhausted: false,
       pageCache: new Map(),
@@ -739,6 +752,25 @@
     }
   };
 
+  const fetchAssetsPage = async (pageToken) => {
+    const params = new URLSearchParams({
+      pageSize: String(ASSETS_PAGE_SIZE),
+      orderBy: "ORDER_BY_CREATE_TIME",
+      workspaceKind: ASSETS_WORKSPACE
+    });
+    if (pageToken) params.set("pageToken", pageToken);
+    try {
+      return await fetchJsonWithRetry(`${ASSET_URL}?${params.toString()}`, {
+        method: "GET",
+        credentials: "include"
+      });
+    } catch (error) {
+      const match = /HTTP (\d+)/.exec(String((error && error.message) || ""));
+      autoRefreshLastFetchStatus = match ? Number(match[1]) : -1;
+      throw error;
+    }
+  };
+
   const fetchConversationResponses = async (conversationId) => {
     if (!conversationId) return [];
     const url = `${CONV_LIST_URL}/${encodeURIComponent(conversationId)}/responses?conversationKind=${CONV_KIND}`;
@@ -1273,6 +1305,27 @@
       else videos.push(item);
     });
     return { videos, images };
+  };
+
+  // The asset list carries its conversation inline, so a flat page of assets groups
+  // into tiles with no follow-up request. Assets with no conversation (a handful) fall
+  // back to standing alone under their own id.
+  const resolveAssetConversationId = (asset) =>
+    normalizeId(
+      (asset && (asset.sourceConversationId || asset.currentConversationId ||
+        asset.rootAssetSourceConversationId)) || ""
+    );
+
+  const extractAssetItems = (assets, orderBase = 0) => {
+    const items = [];
+    (assets || []).forEach((asset, index) => {
+      if (!asset || asset.isDeleted) return;
+      const conversationId = resolveAssetConversationId(asset) || normalizeId(asset.assetId);
+      if (!conversationId) return;
+      const item = buildItemFromAsset(asset, conversationId, orderBase + index);
+      if (item) items.push(item);
+    });
+    return items;
   };
 
   // Every asset referenced anywhere in a conversation's responses, newest last.
@@ -2094,6 +2147,31 @@
     modeState.seen = rebuilt;
   };
 
+  const fetchAndCacheAssetsPage = async (pageIndex) => {
+    const store = state.assets;
+    const token = store.pageTokens[pageIndex] || null;
+    const data = await fetchAssetsPage(token || undefined);
+    const assets = data && Array.isArray(data.assets) ? data.assets : [];
+    const items = [];
+    extractAssetItems(assets, pageIndex * ASSETS_PAGE_SIZE).forEach((item) => {
+      const minItem = item.kind === "image" ? minimizeImageItem(item) : minimizeVideoItem(item);
+      if (!minItem) return;
+      if (minItem.kind === "video" && !ensurePlayableVideoItem(minItem)) return;
+      const key = normalizeId(minItem.postId);
+      if (!key || store.seen.has(key)) return;
+      store.seen.add(key);
+      items.push(minItem);
+    });
+    store.pageCache.set(pageIndex, items);
+    store.totalLoaded += items.length;
+    const nextToken = data && data.nextPageToken ? data.nextPageToken : null;
+    if (nextToken && store.pageTokens[pageIndex + 1] === undefined) {
+      store.pageTokens[pageIndex + 1] = nextToken;
+    }
+    if (!nextToken || !assets.length) store.exhausted = true;
+    invalidateGroupsMemo();
+  };
+
   const fetchAndCacheV2Page = async (pageIndex) => {
     const v2 = state.v2;
     const token = v2.pageTokens[pageIndex] || null;
@@ -2216,21 +2294,10 @@
       if (isGridMode()) {
         const requiredGroups = (pageIndex + 1) * GRID_TILES_PER_PAGE;
         let safety = 0;
-        const everythingExhausted = () =>
-          state.v2.exhausted && videoState.exhausted && imageState.exhausted;
+        const everythingExhausted = () => state.assets.exhausted;
         while (!everythingExhausted() && safety < 500) {
           if (computeAllUnifiedItems().length >= requiredGroups) break;
-          let didFetch = false;
-          // Conversations hold everything created since the v2 rollout, so walk them
-          // first and only fall back to the legacy liked list once they run out.
-          if (!state.v2.exhausted) {
-            await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
-            didFetch = true;
-          } else {
-            if (await fetchOneIfPossible("videos")) didFetch = true;
-            if (await fetchOneIfPossible("images")) didFetch = true;
-          }
-          if (!didFetch) break;
+          await fetchAndCacheAssetsPage(state.assets.pageTokens.length - 1);
           safety += 1;
         }
         const totalGroups = computeAllUnifiedItems().length;
@@ -2295,12 +2362,15 @@
           if (!gridView) prunePageCache(mode, ms.maxPageLoaded);
         }
       };
-      let v2Safety = 0;
-      while (!state.v2.exhausted && v2Safety < 2000) {
-        await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
-        v2Safety += 1;
+      if (gridView) {
+        let assetSafety = 0;
+        while (!state.assets.exhausted && assetSafety < 2000) {
+          await fetchAndCacheAssetsPage(state.assets.pageTokens.length - 1);
+          assetSafety += 1;
+        }
+      } else {
+        await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
       }
-      await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
       let lastPage;
       if (gridView) {
         const totalGroups = computeAllUnifiedItems().length;
@@ -2449,6 +2519,14 @@
     invalidateGroupsMemo(mode);
   };
 
+  const resetAssetsState = () => {
+    state.assets.exhausted = false;
+    state.assets.pageCache.clear();
+    state.assets.pageTokens = [null];
+    state.assets.seen = new Set();
+    state.assets.totalLoaded = 0;
+  };
+
   const resetV2State = () => {
     state.v2.exhausted = false;
     state.v2.pageCache.clear();
@@ -2461,6 +2539,7 @@
   const resetAllModes = () => {
     resetModeState("videos");
     resetModeState("images");
+    resetAssetsState();
     resetV2State();
     state.items = [];
     state.videoItems = [];
@@ -2533,7 +2612,9 @@
   // item was extracted from, order by position in the stream, lead with the parent image.
   const buildPostOrderedGridGroups = () => {
     const buckets = new Map();
-    const caches = [state.v2.pageCache, getModeState("videos").pageCache, getModeState("images").pageCache];
+    // One source only. Legacy post ids and asset ids are the same values, so reading
+    // the legacy caches too would surface the same media under two different roots.
+    const caches = [state.assets.pageCache];
     caches.forEach((cache) => {
       cache.forEach((pageItems) => {
         (pageItems || []).forEach((entry) => {
@@ -2635,7 +2716,7 @@
     if (isGridMode()) {
       const totalGroups = computeAllUnifiedItems().length;
       const pages = Math.max(1, Math.ceil(totalGroups / GRID_TILES_PER_PAGE));
-      return bothExhausted && state.v2.exhausted ? pages : pages + 1;
+      return state.assets.exhausted ? pages : pages + 1;
     }
     const maxLoaded = Math.max(videoState.maxPageLoaded, imageState.maxPageLoaded);
     const base = Math.max(1, maxLoaded + 1);
@@ -2928,7 +3009,13 @@
 
   const deletePostDirect = async (postId) => {
     if (!postId) return { ok: false };
-    if (isConversationAssetId(postId)) return deleteConversationAsset(postId);
+    if (isConversationAssetId(postId)) {
+      const viaAsset = await deleteConversationAsset(postId);
+      if (viaAsset.ok) return viaAsset;
+      // Legacy media appears in the asset list under the same id, but may still only be
+      // removable through the old endpoint. Fall back rather than assume either way.
+      if (viaAsset.status !== 404 && viaAsset.status !== 400) return viaAsset;
+    }
     const response = await fetch(DELETE_URL, {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -2940,20 +3027,15 @@
 
   const deletePost = async (postId) => {
     if (!postId) return { ok: false };
-    if (isConversationAssetId(postId)) {
-      // The favorites fallback speaks the legacy endpoint, which 404s on assets.
-      try {
-        return await deleteConversationAsset(postId);
-      } catch (error) {
-        return { ok: false };
-      }
-    }
+    let direct = null;
     try {
-      const direct = await deletePostDirect(postId);
-      if (direct.ok) return direct;
+      direct = await deletePostDirect(postId);
+      if (direct && direct.ok) return direct;
     } catch (error) {
       // ignore and fallback
     }
+    // The favorites fallback speaks the legacy endpoint, which 404s on v2 assets.
+    if (isConversationAssetId(postId)) return direct || { ok: false };
     const result = await sendToFavorites({ action: "grokViewerDeleteOne", postId });
     if (!result || !result.ok || !result.response) {
       return { ok: false };
@@ -3057,7 +3139,7 @@
   // Collectors that walked only the mode caches silently missed all conversation media.
   const forEachLoadedEntry = (visit) => {
     const caches = [
-      state.v2.pageCache,
+      state.assets.pageCache,
       getModeState("videos").pageCache,
       getModeState("images").pageCache
     ];
@@ -4259,15 +4341,6 @@
 
   const downloadGroup = async (groupArg, options) => {
     let group = groupArg || state.items[state.selectedIndex];
-    // Conversation tiles are lazily hydrated, so pull the full asset list before the
-    // variant-count check below or the folder would hold only the latest item.
-    const hydrateId = normalizeId(group && group.groupId);
-    if (hydrateId && (await hydrateConversationVariants(hydrateId))) {
-      const refreshed = computeAllUnifiedItems().find(
-        (entry) => normalizeId(entry && entry.groupId) === hydrateId
-      );
-      if (refreshed) group = refreshed;
-    }
     const skipFinalWait = !!(options && options.skipFinalWait);
     const bulk = !!(options && options.bulk);
     // When foldering (a folderName is supplied) a single-media post is valid and
@@ -4444,9 +4517,11 @@
     const target = normalizeId(postId);
     if (!target) return false;
     let found = false;
-    state.v2.pageCache.forEach((pageItems) => {
-      (pageItems || []).forEach((entry) => {
-        if (entry && normalizeId(entry.postId) === target) found = true;
+    [state.assets.pageCache].forEach((cache) => {
+      cache.forEach((pageItems) => {
+        (pageItems || []).forEach((entry) => {
+          if (entry && normalizeId(entry.postId) === target) found = true;
+        });
       });
     });
     return found;
@@ -4492,9 +4567,6 @@
   };
 
   const downloadAllVideosForItem = async (item) => {
-    // Conversation tiles hold only their latest asset until hydrated; pull the rest in
-    // first or this reports far less media than the post actually has.
-    await hydrateConversationVariants(normalizeId(item && item.groupId));
     const media = collectMediaUnderPost(item);
     if (!media.length) {
       showToast("No media found under this post.", "info");
@@ -4508,8 +4580,6 @@
 
   const deleteAllVideosForItem = async (item) => {
     if (state.busy) return;
-    // Hydrate first, or a conversation tile only knows about its latest asset.
-    await hydrateConversationVariants(normalizeId(item && item.groupId));
     const videos = collectVideosUnderPost(item);
     if (!videos.length) {
       showToast("No videos found under this post.", "info");
@@ -4803,20 +4873,15 @@
           safety += 1;
         }
       };
-      // Walking every conversation can be hundreds of requests. Throttle them and retry
-      // transient failures, so one blip (or a rate limit) does not abort the whole run.
-      const exhaustConversations = async () => {
-        let safety = 0;
-        while (!state.v2.exhausted && safety < 2000) {
-          await fetchAndCacheV2Page(state.v2.pageTokens.length - 1);
-          safety += 1;
-          setStatus(`Loading conversations... ${state.v2.totalLoaded} items`);
-          await sleep(250);
-        }
-      };
-      await exhaustConversations();
-      setStatus("Loading saved posts...");
-      await Promise.all([exhaustOne("videos"), exhaustOne("images")]);
+      // One flat, newest-first stream covers every post. Rate limits are handled in the
+      // fetch layer; the small delay just keeps the walk from bunching up.
+      let assetSafety = 0;
+      while (!state.assets.exhausted && assetSafety < 2000) {
+        await fetchAndCacheAssetsPage(state.assets.pageTokens.length - 1);
+        assetSafety += 1;
+        setStatus(`Loading media... ${state.assets.totalLoaded} items`);
+        await sleep(150);
+      }
     } catch (error) {
       const detail = String((error && error.message) || error || "unknown error");
       state.busy = false;
@@ -4825,23 +4890,6 @@
       setStatus(`Failed to load all pages: ${detail}`);
       showToast(`Failed to load all pages: ${detail}`, "error");
       return;
-    }
-    invalidateGroupsMemo();
-    updateItems();
-    // Conversation tiles hold only their latest asset until hydrated. Without this pass
-    // every conversation is grouped as a single item and written as its own one-file
-    // folder -- the per-post download looks right only because it hydrates first.
-    const conversationIds = new Set();
-    state.v2.pageCache.forEach((pageItems) => {
-      (pageItems || []).forEach((entry) => {
-        const rootId = normalizeId(entry && entry.rootPostId);
-        if (rootId) conversationIds.add(rootId);
-      });
-    });
-    const pendingConversations = Array.from(conversationIds);
-    for (let i = 0; i < pendingConversations.length; i += 1) {
-      setStatus(`Loading post contents ${i + 1}/${pendingConversations.length}...`);
-      await hydrateConversationVariants(pendingConversations[i]);
     }
     invalidateGroupsMemo();
     updateItems();
@@ -5164,7 +5212,7 @@
     let videoTotal = getModeState("videos").totalLoaded || 0;
     // Same blind spot in the toolbar counter: without this it reads "0 videos" while
     // the grid shows nothing but conversation videos.
-    state.v2.pageCache.forEach((pageItems) => {
+    state.assets.pageCache.forEach((pageItems) => {
       (pageItems || []).forEach((entry) => {
         if (entry && entry.kind !== "image") videoTotal += 1;
       });
@@ -7710,9 +7758,9 @@
       // stream is walked before the legacy one -- so gating on videoItems/imageItems
       // alone left this disabled while the grid was full of conversation tiles.
       const hasAny =
+        state.assets.totalLoaded ||
         state.videoItems.length ||
         state.imageItems.length ||
-        state.v2.totalLoaded ||
         state.items.length;
       downloadAllBtn.disabled = !hasAny || state.busy;
     }
@@ -9079,15 +9127,6 @@
     if (!keepNestedRibbon) consumeNewGenerationHighlight(group);
     updateLightboxAutoplayIcon();
     if (isGridMode()) {
-      // A conversation tile arrives holding only its latest asset; pull the rest of the
-      // conversation in now so the strip shows every variant under it.
-      const conversationId = normalizeId(group && group.groupId);
-      hydrateConversationVariants(conversationId).then((changed) => {
-        if (!changed) return;
-        updateItems();
-        selectGroupByGroupId(conversationId);
-        if (lightboxEl && lightboxEl.classList.contains("open")) loadPlayer();
-      });
       maybeShowNestedGuide();
       if (state.mode === "videos") {
         const keepPostId = normalizeId((resolveActiveItem(group) || group).postId);
