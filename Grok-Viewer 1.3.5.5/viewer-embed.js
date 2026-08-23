@@ -3234,6 +3234,10 @@
   const deleteItem = async (item) => {
     const targetItem = resolveActiveItem(item);
     if (!targetItem || !targetItem.postId || state.busy) return;
+    if (isConversationGroup(item) || isConversationAssetId(targetItem.postId)) {
+      showToast(CONVERSATION_DELETE_UNSUPPORTED, "info");
+      return;
+    }
     if (!window.confirm("Delete this post and all related posts (original + variants + children)?")) return;
     playActionAudio("delete");
     state.busy = true;
@@ -4399,6 +4403,25 @@
     return videos;
   };
 
+  // Verified 2026-08-23: /rest/media/post/delete answers a v2 asset id with
+  // 404 {"code":5,"message":"Media post not found"}. Conversation media simply is not
+  // deletable through the legacy endpoint, so every delete aimed at it is a doomed
+  // request. Block those actions with an honest message instead of firing them.
+  const CONVERSATION_DELETE_UNSUPPORTED =
+    "Deleting conversation media isn't supported yet — Grok's delete endpoint rejects these posts.";
+
+  const isConversationAssetId = (postId) => {
+    const target = normalizeId(postId);
+    if (!target) return false;
+    let found = false;
+    state.v2.pageCache.forEach((pageItems) => {
+      (pageItems || []).forEach((entry) => {
+        if (entry && normalizeId(entry.postId) === target) found = true;
+      });
+    });
+    return found;
+  };
+
   // A conversation group is rooted on a conversation id, which is never one of its own
   // members' post ids; a legacy post's root is its own top-level post.
   const isConversationGroup = (item) => {
@@ -4464,13 +4487,11 @@
     }
     const ids = videos.map((v) => v && v.postId).filter(Boolean);
     if (!ids.length) return;
-    // Conversation assets are not posts in the old sense, and /rest/media/post/delete is
-    // not confirmed to remove one without affecting the rest of the conversation. Say so
-    // rather than implying this behaves like a legacy per-video delete.
-    const warning = isConversationGroup(item)
-      ? "\n\nThis is a conversation post. Deleting its videos individually is not confirmed to behave the same way as for older posts and may affect the whole conversation."
-      : "";
-    if (!window.confirm(`Delete ${ids.length} video${ids.length === 1 ? "" : "s"} under this post?${warning}`)) return;
+    if (isConversationGroup(item) || ids.some(isConversationAssetId)) {
+      showToast(CONVERSATION_DELETE_UNSUPPORTED, "info");
+      return;
+    }
+    if (!window.confirm(`Delete ${ids.length} video${ids.length === 1 ? "" : "s"} under this post?`)) return;
     playActionAudio("delete");
     state.busy = true;
     updateActionButtons();
@@ -4672,9 +4693,18 @@
 
   const deleteCheckedItems = async () => {
     if (state.busy) return;
-    const ids = Array.from(state.selectedPostIds).filter(Boolean);
+    const allSelected = Array.from(state.selectedPostIds).filter(Boolean);
+    const conversationSelected = allSelected.filter(isConversationAssetId);
+    const ids = allSelected.filter((id) => !isConversationAssetId(id));
+    if (conversationSelected.length && !ids.length) {
+      showToast(CONVERSATION_DELETE_UNSUPPORTED, "info");
+      return;
+    }
     if (!ids.length) return;
-    if (!window.confirm(`Delete ${ids.length} checked post${ids.length === 1 ? "" : "s"} (and all related)?`)) return;
+    const skipNote = conversationSelected.length
+      ? `\n\n${conversationSelected.length} conversation post${conversationSelected.length === 1 ? " is" : "s are"} selected and will be skipped — Grok's delete endpoint rejects them.`
+      : "";
+    if (!window.confirm(`Delete ${ids.length} checked post${ids.length === 1 ? "" : "s"} (and all related)?${skipNote}`)) return;
     playActionAudio("delete");
     state.busy = true;
     updateActionButtons();
