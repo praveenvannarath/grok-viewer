@@ -3889,28 +3889,25 @@
     return `${lines.join("\n")}\n`;
   };
 
-  // Bulk downloads write one prompts.txt per post folder rather than a sidecar next to
-  // every file: outside folder mode each extra file is its own browser download (and
-  // its own Save As dialog in ask-each mode), so one file per folder carries the
-  // prompts without doubling the download count.
-  const buildGroupPromptsContent = (items, folderName) => {
-    const blocks = [];
-    (items || []).forEach((item) => {
-      if (!item) return;
+  // Sidecar prompt file: video2.mp4 -> video2.txt, next to the media it describes.
+  const buildPromptSidecarFilename = (mediaFilename) => {
+    const parts = splitNameExt(mediaFilename || "grok-media.mp4");
+    return `${parts.base || "grok-media"}.txt`;
+  };
+
+  // Write one .txt beside a downloaded file. Never fatal: a missing prompt file must
+  // not fail, or even report on, the media download it accompanies.
+  const writePromptSidecar = async (item, mediaFilename, folderName) => {
+    try {
       const prompt = getPromptTextForItem(item);
-      if (!prompt) return;
-      blocks.push(
-        [
-          `File: ${resolveMediaDownloadFilename(item)}`,
-          `Created at: ${getCreatedAtText(item)}`,
-          "Prompt:",
-          prompt
-        ].join("\n")
-      );
-    });
-    if (!blocks.length) return "";
-    const header = [`Post: ${folderName || "Unknown"}`, `Saved at: ${new Date().toISOString()}`, ""];
-    return `${header.concat(blocks.join("\n\n---\n\n")).join("\n")}\n`;
+      if (!prompt) return false;
+      const content = buildPromptInfoContent(item, prompt, mediaFilename);
+      const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+      const result = await downloadGroupFile(blob, buildPromptSidecarFilename(mediaFilename), folderName);
+      return !!(result && result.ok);
+    } catch (error) {
+      return false;
+    }
   };
 
   const extractAskEachFolderPathFromFilename = (filename) => {
@@ -4261,6 +4258,11 @@
           if (await postFileExists(folderName, name)) {
             skippedExisting += 1;
             doneItems.push(item);
+            // Media is already there, but the prompt file may predate this feature.
+            const sidecarName = buildPromptSidecarFilename(name);
+            if (!(await postFileExists(folderName, sidecarName))) {
+              await writePromptSidecar(item, name, folderName);
+            }
             const skipText = `Skipping existing ${folderName}/ ${i + 1}/${items.length}...`;
             setStatus(skipText);
             setDownloadProgress(skipText, (i + 1) / items.length);
@@ -4299,6 +4301,7 @@
             doneItems.push(item);
             lastFilename = result.filename || name;
             lastLocal = !!result.local;
+            await writePromptSidecar(item, name, folderName);
           } else {
             failed += 1;
           }
@@ -4313,20 +4316,6 @@
         }
         recordDownloadedItems(state.mode, doneItems);
         syncVisibleDownloadedBadges();
-        // Only when something new landed -- a folder that was already complete stays
-        // untouched instead of collecting prompts (1).txt on every re-run.
-        if (saved > 0) {
-          const promptsText = buildGroupPromptsContent(doneItems, folderName);
-          if (promptsText) {
-            try {
-              await downloadGroupFile(
-                new Blob([promptsText], { type: "text/plain;charset=utf-8" }),
-                "prompts.txt",
-                folderName
-              );
-            } catch (error) {}
-          }
-        }
         let doneText;
         if (saved && skippedExisting) {
           doneText = `Saved ${saved}, skipped ${skippedExisting} existing → ${folderName}/`;
