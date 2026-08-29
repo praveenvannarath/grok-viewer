@@ -3889,6 +3889,30 @@
     return `${lines.join("\n")}\n`;
   };
 
+  // Bulk downloads write one prompts.txt per post folder rather than a sidecar next to
+  // every file: outside folder mode each extra file is its own browser download (and
+  // its own Save As dialog in ask-each mode), so one file per folder carries the
+  // prompts without doubling the download count.
+  const buildGroupPromptsContent = (items, folderName) => {
+    const blocks = [];
+    (items || []).forEach((item) => {
+      if (!item) return;
+      const prompt = getPromptTextForItem(item);
+      if (!prompt) return;
+      blocks.push(
+        [
+          `File: ${resolveMediaDownloadFilename(item)}`,
+          `Created at: ${getCreatedAtText(item)}`,
+          "Prompt:",
+          prompt
+        ].join("\n")
+      );
+    });
+    if (!blocks.length) return "";
+    const header = [`Post: ${folderName || "Unknown"}`, `Saved at: ${new Date().toISOString()}`, ""];
+    return `${header.concat(blocks.join("\n\n---\n\n")).join("\n")}\n`;
+  };
+
   const extractAskEachFolderPathFromFilename = (filename) => {
     const normalized = String(filename || "").replace(/\\/g, "/").replace(/\/{2,}/g, "/");
     if (!normalized) return "";
@@ -4289,6 +4313,20 @@
         }
         recordDownloadedItems(state.mode, doneItems);
         syncVisibleDownloadedBadges();
+        // Only when something new landed -- a folder that was already complete stays
+        // untouched instead of collecting prompts (1).txt on every re-run.
+        if (saved > 0) {
+          const promptsText = buildGroupPromptsContent(doneItems, folderName);
+          if (promptsText) {
+            try {
+              await downloadGroupFile(
+                new Blob([promptsText], { type: "text/plain;charset=utf-8" }),
+                "prompts.txt",
+                folderName
+              );
+            } catch (error) {}
+          }
+        }
         let doneText;
         if (saved && skippedExisting) {
           doneText = `Saved ${saved}, skipped ${skippedExisting} existing → ${folderName}/`;
