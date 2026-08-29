@@ -3895,18 +3895,25 @@
     return `${parts.base || "grok-media"}.txt`;
   };
 
-  // Write one .txt beside a downloaded file. Never fatal: a missing prompt file must
-  // not fail, or even report on, the media download it accompanies.
+  // Write one .txt beside a downloaded file. Never fatal -- a prompt file must not fail
+  // the media download it accompanies -- but the outcome is reported so a folder that
+  // silently produced no prompts says so instead of looking like a no-op.
+  // "none" = this item has no prompt text at all, which is not a failure.
   const writePromptSidecar = async (item, mediaFilename, folderName) => {
+    let prompt = "";
     try {
-      const prompt = getPromptTextForItem(item);
-      if (!prompt) return false;
+      prompt = getPromptTextForItem(item);
+    } catch (error) {
+      prompt = "";
+    }
+    if (!prompt) return "none";
+    try {
       const content = buildPromptInfoContent(item, prompt, mediaFilename);
       const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
       const result = await downloadGroupFile(blob, buildPromptSidecarFilename(mediaFilename), folderName);
-      return !!(result && result.ok);
+      return result && result.ok ? "ok" : "fail";
     } catch (error) {
-      return false;
+      return "fail";
     }
   };
 
@@ -4247,6 +4254,14 @@
         let saved = 0;
         let failed = 0;
         let skippedExisting = 0;
+        let promptsSaved = 0;
+        let promptsFailed = 0;
+        let promptsMissing = 0;
+        const tallyPrompt = (outcome) => {
+          if (outcome === "ok") promptsSaved += 1;
+          else if (outcome === "fail") promptsFailed += 1;
+          else promptsMissing += 1;
+        };
         const doneItems = [];
         let lastFilename = "";
         let lastLocal = false;
@@ -4260,8 +4275,10 @@
             doneItems.push(item);
             // Media is already there, but the prompt file may predate this feature.
             const sidecarName = buildPromptSidecarFilename(name);
-            if (!(await postFileExists(folderName, sidecarName))) {
-              await writePromptSidecar(item, name, folderName);
+            if (await postFileExists(folderName, sidecarName)) {
+              promptsSaved += 1;
+            } else {
+              tallyPrompt(await writePromptSidecar(item, name, folderName));
             }
             const skipText = `Skipping existing ${folderName}/ ${i + 1}/${items.length}...`;
             setStatus(skipText);
@@ -4301,7 +4318,7 @@
             doneItems.push(item);
             lastFilename = result.filename || name;
             lastLocal = !!result.local;
-            await writePromptSidecar(item, name, folderName);
+            tallyPrompt(await writePromptSidecar(item, name, folderName));
           } else {
             failed += 1;
           }
@@ -4325,6 +4342,13 @@
           doneText = `Saved ${saved}/${saved + failed} to ${folderName}/`;
         } else {
           doneText = `Saved ${saved} file${saved === 1 ? "" : "s"} to ${folderName}/`;
+        }
+        if (promptsFailed) {
+          doneText += ` — ${promptsFailed} prompt file${promptsFailed === 1 ? "" : "s"} failed`;
+        } else if (!promptsSaved && promptsMissing) {
+          doneText += " — no prompt text on these";
+        } else if (promptsSaved) {
+          doneText += ` + ${promptsSaved} prompt file${promptsSaved === 1 ? "" : "s"}`;
         }
         setStatus(doneText);
         setDownloadProgress(doneText, 1);
@@ -9909,7 +9933,12 @@ const initHideModToastTooltip = () => {};
       sortByCreatedAt,
       groupsMemoStamp,
       groupsMemoFor,
-      groupsMemoResult
+      groupsMemoResult,
+      collectMediaUnderPost,
+      getPromptTextForItem,
+      buildPromptSidecarFilename,
+      resolveGroupFolderName,
+      getDownloadMode
     };
   } catch (error) {}
 
