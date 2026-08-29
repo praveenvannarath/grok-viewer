@@ -16,6 +16,11 @@
   const ASSET_URL = "/rest/assets";
   const ASSETS_PAGE_SIZE = 60;
   const ASSETS_WORKSPACE = "WORKSPACE_KIND_IMAGINE_ALL";
+  // The list projection drops mediaGenInput, so prompts come from a conversation's
+  // responses instead. Note the param here is conversationKind, unlike the
+  // conversation list endpoint, which spells it kind.
+  const CONVERSATION_URL = "/rest/app-chat/conversations";
+  const CONVERSATION_KIND = "CONVERSATION_KIND_IMAGINE";
   const GRID_TILES_PER_PAGE = 40;
   const SOURCE = "MEDIA_POST_SOURCE_LIKED";
   const REGEN_COOLDOWN_MS = 15000;
@@ -1195,6 +1200,86 @@
   // Turn a v2 asset descriptor (conversation latestAssetMetadata, or a response's
   // fileAttachmentAssetMetadata entry) into the same item shape the rest of the viewer
   // consumes. `key` is a bare "users/..." path that normalizeUrl already resolves.
+  // mediaGenInput holds exactly one operation key -- imageToImage, textToVideo,
+  // imageToVideo, ... -- so read the prompt from whichever key is present instead of
+  // guessing at the full list of operation names.
+  const extractAssetPrompt = (asset) => {
+    const gen = (asset && asset.mediaGenInput) || null;
+    if (!gen || typeof gen !== "object") return "";
+    const keys = Object.keys(gen);
+    for (let i = 0; i < keys.length; i += 1) {
+      const leaf = gen[keys[i]];
+      const prompt = leaf && typeof leaf === "object" ? String(leaf.prompt || "").trim() : "";
+      if (prompt) return prompt;
+    }
+    return "";
+  };
+
+  // Verified 2026-08-29: the /rest/assets LIST response no longer carries
+  // mediaGenInput (0 of 60 on the newest page), though GET /rest/assets/{id} still
+  // does -- the list is a thinner projection, and no view/readMask/expand parameter
+  // brings the field back (nine variants probed, all identical 28-field payloads).
+  // A conversation's /responses returns every asset with its gen input intact, so one
+  // request per conversation recovers the prompts for a whole post at once. That beats
+  // GET /rest/assets/{id}, which would cost one request per file.
+  const conversationPromptCache = new Map();
+
+  const fetchConversationPrompts = async (conversationId) => {
+    const convId = normalizeId(conversationId);
+    if (!convId) return null;
+    if (conversationPromptCache.has(convId)) return conversationPromptCache.get(convId);
+    const map = new Map();
+    let data = null;
+    try {
+      data = await fetchJsonWithRetry(
+        `${CONVERSATION_URL}/${encodeURIComponent(convId)}/responses?conversationKind=${CONVERSATION_KIND}`,
+        { method: "GET", credentials: "include" }
+      );
+    } catch (error) {
+      // Don't cache a failure -- a 429 or a dropped connection would otherwise cost
+      // this conversation its prompts for the rest of the session.
+      return null;
+    }
+    const responses = (data && data.responses) || [];
+    responses.forEach((response) => {
+      const attachments = (response && response.fileAttachmentAssetMetadata) || [];
+      attachments.forEach((asset) => {
+        const id = normalizeId(asset && asset.assetId);
+        if (!id || map.has(id)) return;
+        const prompt = extractAssetPrompt(asset);
+        if (prompt) map.set(id, prompt);
+      });
+    });
+    conversationPromptCache.set(convId, map);
+    return map;
+  };
+
+  // Fill in promptText on items the asset stream delivered without one. Mutates the
+  // cached entries, so a conversation is fetched at most once however many times its
+  // media is downloaded.
+  const hydratePromptsForItems = async (items) => {
+    const missing = (items || []).filter((item) => item && !normalizeId(item.promptText));
+    if (!missing.length) return;
+    const convIds = [];
+    const seenConv = new Set();
+    missing.forEach((item) => {
+      const convId = normalizeId(item.rootPostId) || normalizeId(item.parentPostId);
+      // Legacy posts carry their prompt inline and have no conversation to ask.
+      if (!convId || seenConv.has(convId) || !isAssetStreamId(item.postId)) return;
+      seenConv.add(convId);
+      convIds.push(convId);
+    });
+    for (let i = 0; i < convIds.length; i += 1) {
+      const map = await fetchConversationPrompts(convIds[i]);
+      if (!map || !map.size) continue;
+      missing.forEach((item) => {
+        if (normalizeId(item.promptText)) return;
+        const prompt = map.get(normalizeId(item.postId));
+        if (prompt) item.promptText = prompt;
+      });
+    }
+  };
+
   const buildItemFromAsset = (asset, conversationId, order) => {
     if (!asset || asset.isDeleted) return null;
     const key = String(asset.key || "");
@@ -1208,7 +1293,7 @@
     const previewKey = aux["preview-image"] || aux["original-image"] || "";
     const gen = (asset && asset.mediaGenInput) || {};
     const genLeaf = gen.imageToVideo || gen.textToVideo || gen.textToImage || gen.imageToImage || {};
-    const promptText = String(genLeaf.prompt || "").trim();
+    const promptText = extractAssetPrompt(asset);
     const width = toPositiveSize(asset.width);
     const height = toPositiveSize(asset.height);
     const base = {
@@ -4251,6 +4336,11 @@
           return true;
         });
         const folderName = await resolveGroupFolderName(group, options);
+        // One request per conversation, cached, so the prompt sidecars have something
+        // to write. Failure here must not stop the media download.
+        try {
+          await hydratePromptsForItems(items);
+        } catch (error) {}
         let saved = 0;
         let failed = 0;
         let skippedExisting = 0;
@@ -7536,7 +7626,14 @@
   };
 
   const handlePromptItem = async (item, context = null) => {
-    const prompt = getPromptTextForItem(item);
+    let prompt = getPromptTextForItem(item);
+    if (!prompt) {
+      // Same cause as the empty download sidecars: the asset list omits mediaGenInput.
+      try {
+        await hydratePromptsForItems([resolveActiveItem(item) || item]);
+      } catch (error) {}
+      prompt = getPromptTextForItem(item);
+    }
     if (!prompt) {
       if (promptErrorAudio) {
         try {
